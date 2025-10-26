@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 import json
 
+# وارد کردن صریح types برای رفع خطای Pydantic/ValidationError
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,6 +14,7 @@ from telegram.ext import (
     CommandHandler,
 )
 from google import genai
+from google.genai import types # مهم: وارد کردن types برای تبدیل صریح
 from google.genai.errors import APIError
 
 # --- تنظیمات لاگ‌گیری (Logging) ---
@@ -229,11 +231,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
-    # [اصلاح نهایی] استفاده مستقیم از متن (String) به عنوان Part برای جلوگیری از TypeError
-    user_part = user_text 
+    # [اصلاح نهایی برای رفع ValidationError] تبدیل صریح String به types.Part
+    user_part = types.Part.from_text(user_text)
     
     # افزودن پیام جدید کاربر به تاریخچه
-    context.user_data['history'].append(genai.types.Content(role="user", parts=[user_part]))
+    context.user_data['history'].append(types.Content(role="user", parts=[user_part]))
     
     conversation_history = context.user_data['history']
     
@@ -253,7 +255,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         response = ai_client.models.generate_content(
             model=AI_MODEL,
             contents=conversation_history, 
-            config=genai.types.GenerateContentConfig(
+            config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 tools=[add_new_customer, log_interaction, get_customer_info]
             )
@@ -267,7 +269,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             tool_responses = []
             
             # ذخیره فراخوانی تابع AI در تاریخچه
-            context.user_data['history'].append(genai.types.Content(role="model", parts=[genai.types.Part.from_function_calls(function_calls)]))
+            context.user_data['history'].append(types.Content(role="model", parts=[types.Part.from_function_calls(function_calls)]))
             
             for call in function_calls:
                 function_name = call.name
@@ -284,34 +286,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     tool_result = f"خطا: تابع {function_name} ناشناخته است."
                     
                 tool_responses.append(
-                    genai.types.Part.from_function_response(
+                    types.Part.from_function_response(
                         name=function_name,
                         response={"result": tool_result}
                     )
                 )
 
             # ذخیره نتیجه اجرای توابع در تاریخچه
-            context.user_data['history'].append(genai.types.Content(role="tool", parts=tool_responses))
+            context.user_data['history'].append(types.Content(role="tool", parts=tool_responses))
             
             # مرحله ۲: ارسال نتیجه و تاریخچه به‌روز شده به Gemini برای تولید پاسخ نهایی
             final_response = ai_client.models.generate_content(
                 model=AI_MODEL,
                 contents=context.user_data['history'], 
-                config=genai.types.GenerateContentConfig(
+                config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     tools=[add_new_customer, log_interaction, get_customer_info]
                 )
             )
             
             # ذخیره پاسخ نهایی AI در تاریخچه
-            context.user_data['history'].append(final_response.candidates[0].content)
+            # [اصلاح ایمنی] بررسی کنید که آیا کاندیداها و محتوا وجود دارد
+            if final_response.candidates and final_response.candidates[0].content:
+                context.user_data['history'].append(final_response.candidates[0].content)
 
             await update.message.reply_text(final_response.text)
 
         # ۲. اگر هوش مصنوعی مستقیماً پاسخ داد (بدون نیاز به دیتابیس)
         else:
             # ذخیره پاسخ مستقیم AI در تاریخچه
-            context.user_data['history'].append(response.candidates[0].content)
+            if response.candidates and response.candidates[0].content:
+                context.user_data['history'].append(response.candidates[0].content)
             await update.message.reply_text(response.text)
 
     except APIError as e:
@@ -319,7 +324,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠️ خطای API رخ داد. لطفاً چند دقیقه دیگر امتحان کنید.")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
-        await update.message.reply_text(f"❓ یک خطای نامشخص رخ داد: {e}. لطفا دوباره تلاش کنید.")
+        await update.message.reply_text(f"❓ یک خطای نامشخص رخ داد. لطفاً لاگ‌های سرور را بررسی کنید. خطا: {e}")
 
 
 # --- توابع هندلر کمکی (اختیاری) ---
@@ -361,11 +366,12 @@ def main() -> None:
         url_path = TELEGRAM_BOT_TOKEN 
         webhook_url = f"{RENDER_EXTERNAL_URL}/{url_path}"
         
+        # [اصلاح پورت] استفاده از PORT که در ابتدای فایل تعریف شده است (پیش‌فرض 8000)
         logger.info(f"Setting up Webhook at {webhook_url} on port {PORT}")
 
         application.run_webhook(
             listen="0.0.0.0",
-            port=PORT,
+            port=PORT, 
             url_path=url_path,
             webhook_url=webhook_url
         )
