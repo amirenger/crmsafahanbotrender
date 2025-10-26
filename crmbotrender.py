@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime
 import json
 
-# وارد کردن صریح types برای رفع خطای Pydantic/ValidationError
+# وارد کردن صریح types برای رفع خطاهای Pydantic و TypeError
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -231,8 +231,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
-    # [اصلاح نهایی برای رفع ValidationError] تبدیل صریح String به types.Part
-    user_part = types.Part.from_text(user_text)
+    # [اصلاح نهایی و قطعی برای رفع ValidationError و TypeError] 
+    # ساخت آبجکت Part با استفاده از سازنده کلاس به جای متد from_text
+    user_part = types.Part(text=user_text)
     
     # افزودن پیام جدید کاربر به تاریخچه
     context.user_data['history'].append(types.Content(role="user", parts=[user_part]))
