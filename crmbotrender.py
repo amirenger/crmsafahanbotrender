@@ -5,7 +5,10 @@ from datetime import datetime
 import json
 import asyncio # برای قابلیت هشدار در بک‌گراند
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, ChatAction
+# اصلاح خطای ImportError: ChatAction از telegram.constants وارد شد
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.constants import ChatAction 
+
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -295,7 +298,10 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # تولید محتوای CSV
-    csv_content = ["ID,نام,تلفن,شرکت,حوزه کاری,خدمات مورد نظر,CRM User ID"]
+    # تعریف هدرها به فارسی برای خوانایی بهتر
+    header_list = ["ID","نام","تلفن","شرکت","حوزه کاری","خدمات مورد نظر","CRM User ID"]
+    csv_content = [",".join(header_list)]
+    
     for row in customers:
         # جایگزینی کاما با نقطه ویرگول یا حذف آن برای جلوگیری از بهم ریختگی CSV
         safe_row = [str(item).replace(',', ';') if item else '' for item in row]
@@ -303,7 +309,7 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     file_name = f"CRM_Customers_Export_{TODAY_DATE}.csv"
     
-    # ارسال فایل (از طریق حافظه در محیط Render)
+    # ارسال فایل (با استفاده از utf-8 برای پشتیبانی از فارسی)
     await context.bot.send_document(
         chat_id=chat_id, 
         document=bytes("\n".join(csv_content).encode('utf-8')),
@@ -373,7 +379,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
-    # [اصلاح قطعی] ساخت آبجکت Part
     user_part = types.Part(text=user_text)
     
     # افزودن پیام جدید کاربر به تاریخچه
@@ -390,7 +395,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "**قوانین:** 1. هرگاه داده‌های اجباری برای یک تابع جمع‌آوری شد، آن را فراخوانی کنید. 2. همیشه پاسخ های خود را به زبان فارسی و دوستانه بنویسید. 3. در فراخوانی تابع set_reminder، 'chat_id' را برابر با **" + str(chat_id) + "** قرار دهید."
     )
 
-    await context.bot.send_chat_action(chat_id=chat_id, action='TYPING')
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     
     try:
         # مرحله ۱: ارسال درخواست با تاریخچه مکالمه
@@ -484,7 +489,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
     
-    # اصلاح Syntax Error در تعریف پیام
+    # اصلاح Syntax Error با استفاده از یک پرانتز برای اتصال خطوط
     message = (
         f"🤖 **CRM Bot هوشمند با تحلیل و حافظه کامل**\n\n"
         f"✨ وضعیت AI: {ai_status}\n"
@@ -510,7 +515,6 @@ def main() -> None:
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
         # اجرای وظیفه بک‌گراند هشدار (با استفاده از Job Queue)
-        # زمان اجرای اولیه (0) به معنای بلافاصله پس از شروع برنامه است.
         application.job_queue.run_once(
             lambda context: asyncio.create_task(reminder_checker(application)),
             0
