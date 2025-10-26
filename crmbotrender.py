@@ -3,9 +3,9 @@ import logging
 import sqlite3
 from datetime import datetime
 import json
-import asyncio # برای قابلیت هشدار در بک‌گراند
+import asyncio 
 
-# اصلاح خطای ImportError: ChatAction از telegram.constants وارد شد
+# --- اصلاح خطای ImportError: ChatAction از telegram.constants وارد شد ---
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction 
 
@@ -514,11 +514,12 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
-        # اجرای وظیفه بک‌گراند هشدار (با استفاده از Job Queue)
-        application.job_queue.run_once(
-            lambda context: asyncio.create_task(reminder_checker(application)),
-            0
-        )
+        # اجرای وظیفه بک‌گراند هشدار (با رفع خطای AttributeError)
+        if application.job_queue:
+            application.job_queue.run_once(
+                lambda context: asyncio.create_task(reminder_checker(application)),
+                0
+            )
 
         url_path = TELEGRAM_BOT_TOKEN 
         webhook_url = f"{RENDER_EXTERNAL_URL}/{url_path}"
@@ -545,11 +546,12 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    # اجرای وظیفه بک‌گراند هشدار 
-    application.job_queue.run_once(
-        lambda context: asyncio.create_task(reminder_checker(application)),
-        0
-    )
+    # اجرای وظیفه بک‌گراند هشدار (با رفع خطای AttributeError)
+    if application.job_queue:
+        application.job_queue.run_once(
+            lambda context: asyncio.create_task(reminder_checker(application)),
+            0
+        )
 
     logger.info("Starting Memory-Enabled Free-Form CRM Bot (Polling Mode)...")
     application.run_polling(poll_interval=3.0)
