@@ -3,9 +3,9 @@ import logging
 import sqlite3
 from datetime import datetime
 import json
+import asyncio # برای قابلیت هشدار در بک‌گراند
 
-# وارد کردن صریح types برای رفع خطاهای Pydantic و TypeError
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, ChatAction
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -14,10 +14,10 @@ from telegram.ext import (
     CommandHandler,
 )
 from google import genai
-from google.genai import types # مهم: وارد کردن types برای تبدیل صریح
+from google.genai import types 
 from google.genai.errors import APIError
 
-# --- تنظیمات لاگ‌گیری (Logging) ---
+# --- تنظیمات لاگ‌گیری ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -25,8 +25,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # =================================================================
-# --- متغیرهای حیاتی و محیطی (Environment Variables) ---
-# در Render، این مقادیر از طریق متغیرهای محیطی (OS) تنظیم می شوند
+# --- متغیرهای حیاتی و محیطی ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
 DB_FILE = "crm_free_form_data.db" 
@@ -36,7 +35,7 @@ PORT = int(os.environ.get('PORT', '8000'))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 # =================================================================
 
-# --- آماده‌سازی هوش مصنوعی (AI Setup) و ثابت‌ها ---
+# --- آماده‌سازی هوش مصنوعی و ثابت‌ها ---
 ai_client = None
 AI_MODEL = 'gemini-2.5-flash'
 TODAY_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -58,6 +57,7 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # جدول مشتریان (Customer Table)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,11 +66,12 @@ def init_db():
             company TEXT,
             industry TEXT,
             services TEXT,
-            crm_user_id INTEGER NOT NULL,
+            crm_user_id INTEGER DEFAULT 0,
             UNIQUE(name, phone)
         )
     """)
     
+    # جدول تعاملات (Interactions Table)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS interactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +82,18 @@ def init_db():
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         )
     """)
+    
+    # جدول هشدارها (Reminders Table) برای قابلیت ۳
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            customer_name TEXT,
+            reminder_text TEXT NOT NULL,
+            due_date_time TEXT NOT NULL,
+            sent INTEGER DEFAULT 0
+        )
+    """)
     conn.commit()
     conn.close()
     logger.info(f"Free-Form CRM Database {DB_FILE} initialized.")
@@ -89,42 +102,68 @@ def init_db():
 # --- توابع (Functions) که هوش مصنوعی به آنها دسترسی دارد (Tools) ---
 # =================================================================
 
-def add_new_customer(name: str, phone: str, company: str = None, industry: str = None, services: str = None) -> str:
+def manage_customer_data(name: str, phone: str, company: str = None, industry: str = None, services: str = None) -> str:
     """
-    برای ثبت یک مشتری جدید در دیتابیس استفاده می شود. نام و شماره تلفن الزامی هستند. 
-    اگر مشتری با این نام و شماره قبلا وجود داشته باشد، خطا بازگردانده می شود.
-    Gemini باید قبل از فراخوانی مطمئن شود که نام و تلفن در دسترس است.
+    برای ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود استفاده می‌شود. (قابلیت ۱ و ۲)
+    اگر مشتری با نام و تلفن وجود داشته باشد، اطلاعات غیرخالی آن به‌روز می‌شود. نام و تلفن الزامی هستند.
     """
     if not name or not phone:
-        return "خطا: نام و شماره تلفن برای ثبت مشتری جدید الزامی هستند."
+        return "خطا: نام و شماره تلفن برای ثبت یا به‌روزرسانی مشتری الزامی هستند."
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    crm_user_id = 0 
 
-    try:
-        # جایگزینی مقادیر Null با None برای دیتابیس
-        company = company if company else None
-        industry = industry if industry else None
-        services = services if services else None
+    # 1. جستجوی مشتری موجود
+    cursor.execute("SELECT id FROM customers WHERE name = ? AND phone = ?", (name, phone))
+    existing_customer = cursor.fetchone()
+
+    if existing_customer:
+        customer_id = existing_customer[0]
+        updates = []
+        params = []
+        if company:
+            updates.append("company = ?")
+            params.append(company)
+        if industry:
+            updates.append("industry = ?")
+            params.append(industry)
+        if services:
+            updates.append("services = ?")
+            params.append(services)
         
-        cursor.execute("""
-            INSERT INTO customers (name, phone, company, industry, services, crm_user_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (name, phone, company, industry, services, crm_user_id))
-        conn.commit()
-        customer_id = cursor.lastrowid
-        return f"عملیات ثبت مشتری موفق بود. مشتری '{name}' (ID: {customer_id}) با موفقیت ثبت شد."
-    except sqlite3.IntegrityError:
-        return f"خطا: مشتری با نام '{name}' و شماره '{phone}' قبلا در سیستم ثبت شده است."
-    finally:
-        conn.close()
+        if updates:
+            query = f"UPDATE customers SET {', '.join(updates)} WHERE id = ?"
+            params.append(customer_id)
+            cursor.execute(query, tuple(params))
+            conn.commit()
+            conn.close()
+            return f"اطلاعات مشتری '{name}' (ID: {customer_id}) با موفقیت به‌روزرسانی شد."
+        else:
+            conn.close()
+            return f"مشتری '{name}' (ID: {customer_id}) قبلاً ثبت شده و اطلاعات جدیدی برای به‌روزرسانی وجود نداشت."
+    else:
+        # 2. ثبت مشتری جدید
+        crm_user_id = 0 
+        try:
+            cursor.execute("""
+                INSERT INTO customers (name, phone, company, industry, services, crm_user_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (name, phone, company, industry, services, crm_user_id))
+            conn.commit()
+            customer_id = cursor.lastrowid
+            conn.close()
+            return f"عملیات ثبت مشتری موفق بود. مشتری '{name}' (ID: {customer_id}) با موفقیت ثبت شد."
+        except sqlite3.IntegrityError:
+            conn.close()
+            return f"خطا: مشتری با نام '{name}' و شماره '{phone}' قبلا در سیستم ثبت شده است."
+        except Exception as e:
+            conn.close()
+            return f"خطای ناشناخته در ثبت مشتری: {e}"
 
 
 def log_interaction(customer_name: str, interaction_report: str, follow_up_date: str = None) -> str:
     """
-    برای ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود استفاده می شود.
-    باید ابتدا مشتری را با 'customer_name' پیدا کند.
+    برای ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود استفاده می شود. (قابلیت ۲)
     اگر تاریخ پیگیری به صورت 'هفته آینده' یا 'ماه بعد' باشد، Gemini باید آن را به فرمت YYYY-MM-DD تبدیل کند.
     """
     conn = sqlite3.connect(DB_FILE)
@@ -150,21 +189,68 @@ def log_interaction(customer_name: str, interaction_report: str, follow_up_date:
     return f"گزارش تماس با '{customer_name}' با موفقیت ثبت شد. {follow_up_msg}"
 
 
-def get_customer_info(name_or_industry: str, info_type: str = "full_report") -> str:
+def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id: int) -> str:
     """
-    برای دریافت گزارش یا اطلاعات خاصی از مشتری یا گروهی از مشتریان استفاده می شود.
-    پارامتر info_type می تواند: 'full_report' (گزارش کامل یک مشتری), 'chance_analysis' (تحلیل شانس فروش) یا 'industry_list' (لیست مشتریان یک حوزه کاری) باشد.
+    برای تنظیم یک یادآوری یا هشدار در مورد مشتری یا هر رویداد دیگری استفاده می شود. (قابلیت ۳)
+    تاریخ و زمان باید به فرمت دقیق 'YYYY-MM-DD HH:MM:SS' یا 'YYYY-MM-DD' توسط Gemini تبدیل شوند.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO reminders (chat_id, customer_name, reminder_text, due_date_time)
+            VALUES (?, ?, ?, ?)
+        """, (chat_id, customer_name, reminder_text, date_time))
+        conn.commit()
+        return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت ثبت شد."
+    except Exception as e:
+        return f"خطا در ثبت هشدار: {e}"
+    finally:
+        conn.close()
+
+
+def get_report(query_type: str, search_term: str = None, fields: str = "all") -> str:
+    """
+    برای دریافت گزارش یا اطلاعات خاصی از مشتریان (مانند گزارش هوشمند صنفی) استفاده می شود. (قابلیت ۴)
+    query_type می تواند: 'full_customer' (گزارش کامل یک مشتری), 'industry_search' (جستجوی مشتریان یک صنف), یا 'interaction_summary' (خلاصه تعاملات).
+    fields یک رشته است که فیلدهای مورد نیاز را با کاما جدا می کند (مثلاً 'name,phone,company').
     """
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     output = []
-
-    if info_type == 'full_report':
-        cursor.execute("SELECT * FROM customers WHERE name = ? COLLATE NOCASE", (name_or_industry,))
+    
+    if query_type == 'industry_search' and search_term:
+        field_names = [f.strip() for f in fields.split(',')]
+        
+        # اگر فیلدهای خاصی خواسته نشده، فقط نام و تلفن را بگیرید
+        select_fields = ", ".join(field_names) if fields != "all" else "name, phone, company, industry"
+        
+        cursor.execute(f"SELECT {select_fields} FROM customers WHERE industry LIKE ?", ('%' + search_term + '%',))
+        customers = cursor.fetchall()
+        
+        if not customers:
+            return f"هیچ مشتری در حوزه '{search_term}' پیدا نشد."
+            
+        output.append(f"مشتریان در حوزه '{search_term}' (فیلدهای: {select_fields}):\n")
+        # اضافه کردن هدر جدول برای خوانایی
+        if fields == "all":
+             output.append(" | ".join(["نام", "تلفن", "شرکت", "صنعت"]))
+             output.append("-" * 50)
+        
+        for row in customers:
+            output.append(" | ".join([str(item) for item in row]))
+            
+        conn.close()
+        return "\n".join(output)
+        
+    elif query_type == 'full_customer' and search_term:
+        # منطق گزارش کامل مشتری (مثل نسخه قبلی)
+        cursor.execute("SELECT * FROM customers WHERE name = ? COLLATE NOCASE", (search_term,))
         customer = cursor.fetchone()
         
         if not customer:
-            return f"خطا: مشتری با نام '{name_or_industry}' پیدا نشد."
+            conn.close()
+            return f"خطا: مشتری با نام '{search_term}' پیدا نشد."
             
         keys = ["ID", "نام", "تلفن", "شرکت", "حوزه کاری", "خدمات مورد نظر", "CRM User ID"]
         output.append("جزئیات مشتری:\n" + json.dumps(dict(zip(keys, customer)), ensure_ascii=False, indent=2))
@@ -179,60 +265,117 @@ def get_customer_info(name_or_industry: str, info_type: str = "full_report") -> 
         else:
             output.append("هیچ گزارش تعاملی ثبت نشده است.")
         
+        conn.close()
         return "\n".join(output)
-        
-    elif info_type == 'industry_list':
-        cursor.execute("SELECT name, phone, company FROM customers WHERE industry LIKE ?", ('%' + name_or_industry + '%',))
-        customers = cursor.fetchall()
-        
-        if not customers:
-            return f"هیچ مشتری در حوزه '{name_or_industry}' پیدا نشد."
-            
-        output.append(f"مشتریان در حوزه '{name_or_industry}':\n")
-        for name, phone, company in customers:
-            output.append(f"- {name} ({company or '---'}): {phone}")
-        return "\n".join(output)
-
-    elif info_type == 'chance_analysis':
-        cursor.execute("SELECT name FROM customers")
-        all_customers = [row[0] for row in cursor.fetchall()]
-        
-        analysis_data = []
-        for name in all_customers:
-            cursor.execute("""
-                SELECT report 
-                FROM interactions i JOIN customers c ON i.customer_id = c.id 
-                WHERE c.name = ?
-            """, (name,))
-            reports = [row[0] for row in cursor.fetchall()]
-            analysis_data.append({"customer": name, "reports": reports})
-            
-        return json.dumps(analysis_data, ensure_ascii=False)
         
     conn.close()
-    return "خطای ناشناخته در تابع get_customer_info."
+    return f"نوع گزارش '{query_type}' پشتیبانی نمی‌شود یا عبارت جستجو مشخص نیست."
 
 # =================================================================
-# --- تابع اصلی هندلر پیام (Free-Form Handler) با قابلیت حافظه ---
+# --- توابع مدیریت تلگرام (قابلیت ۵ و ۶) ---
+# =================================================================
+
+async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    تولید فایل CSV از اطلاعات کامل مشتریان و ارسال آن به کاربر (قابلیت ۵).
+    این تابع مستقیماً توسط دکمه تلگرام فراخوانی می‌شود و به Function Calling ربطی ندارد.
+    """
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM customers")
+    customers = cursor.fetchall()
+    
+    if not customers:
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ دیتابیس مشتریان خالی است. فایلی برای ارسال وجود ندارد.")
+        conn.close()
+        return
+
+    # تولید محتوای CSV
+    csv_content = ["ID,نام,تلفن,شرکت,حوزه کاری,خدمات مورد نظر,CRM User ID"]
+    for row in customers:
+        # جایگزینی کاما با نقطه ویرگول یا حذف آن برای جلوگیری از بهم ریختگی CSV
+        safe_row = [str(item).replace(',', ';') if item else '' for item in row]
+        csv_content.append(",".join(safe_row))
+        
+    file_name = f"CRM_Customers_Export_{TODAY_DATE}.csv"
+    
+    # ارسال فایل (از طریق حافظه در محیط Render)
+    await context.bot.send_document(
+        chat_id=chat_id, 
+        document=bytes("\n".join(csv_content).encode('utf-8')),
+        filename=file_name,
+        caption="فایل کامل مشتریان CRM با فرمت CSV"
+    )
+    conn.close()
+
+
+# =================================================================
+# --- وظیفه بک‌گراند برای هشدارها (قابلیت ۳) ---
+# =================================================================
+
+async def reminder_checker(application: Application):
+    """وظیفه دوره‌ای برای بررسی و ارسال هشدارهای ثبت شده."""
+    while True:
+        await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک می‌کند
+        
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        # جستجوی هشدارهایی که زمان آنها رسیده و هنوز ارسال نشده‌اند
+        # استفاده از LIKE برای تطبیق با تاریخ کامل یا فقط تاریخ
+        cursor.execute("""
+            SELECT id, chat_id, customer_name, reminder_text 
+            FROM reminders 
+            WHERE due_date_time LIKE ? || '%' AND sent = 0
+        """, (current_time_str[:16],)) # تطبیق تا دقیقه
+        
+        reminders = cursor.fetchall()
+        
+        for reminder_id, chat_id, customer_name, reminder_text in reminders:
+            try:
+                # ارسال پیام هشدار
+                message = f"🔔 **هشدار CRM**\n\nمشتری: **{customer_name or 'عمومی'}**\nپیام: _{reminder_text}_\n\n"
+                await application.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                
+                # به‌روزرسانی وضعیت ارسال
+                cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to send reminder {reminder_id} to {chat_id}: {e}")
+                
+        conn.close()
+
+# =================================================================
+# --- تابع اصلی هندلر پیام (Free-Form Handler) ---
 # =================================================================
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    هندلر واحد برای پردازش تمام پیام‌ها. از Function Calling و حافظه مکالمه استفاده می‌کند.
-    """
+    """هندلر اصلی برای پردازش پیام‌ها، Function Calling و تحلیل هوشمند (قابلیت ۷)."""
     
-    if not ai_client:
-        await update.message.reply_text("❌ سرویس هوش مصنوعی غیرفعال است.")
+    if not ai_client or not update.message or not update.message.text:
         return
 
     user_text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    # بررسی دکمه‌های آماده (قابلیت ۶)
+    if user_text.strip() == "📥 ارسال فایل کل مشتریان":
+        await export_data_to_file(update, context)
+        return
+    
+    # برای سایر دکمه‌ها، صرفاً متن را به هوش مصنوعی می‌فرستیم تا تصمیم بگیرد (مثلاً برای "ثبت اطلاعات جدید")
     
     # --- 1. مدیریت حافظه مکالمه (Conversation History) ---
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
-    # [اصلاح نهایی و قطعی برای رفع ValidationError و TypeError] 
-    # ساخت آبجکت Part با استفاده از سازنده کلاس به جای متد from_text
+    # [اصلاح قطعی] ساخت آبجکت Part
     user_part = types.Part(text=user_text)
     
     # افزودن پیام جدید کاربر به تاریخچه
@@ -240,16 +383,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     conversation_history = context.user_data['history']
     
-    # تعریف پرامپت سیستمی (System Instruction)
+    # تعریف پرامپت سیستمی (System Instruction) (قابلیت ۷)
     system_instruction = (
-        "شما یک دستیار هوشمند CRM با **حافظه کامل مکالمه** هستید. وظیفه اصلی شما ثبت دقیق داده ها، گزارش تماس ها، و پاسخگویی تحلیلی است. "
-        "**اولویت شما انجام عملیات با حداقل داده‌های اجباری (نام و تلفن برای ثبت) است**، حتی اگر در مراحل قبلی داده‌هایی مثل شرکت یا خدمات را درخواست کرده‌اید. "
-        "اگر کاربر داده‌ها را در چند پیام متوالی ارائه کرد، باید اطلاعات را از **تاریخچه مکالمه** استخراج و عملیات را تکمیل کنید. "
-        "شما به توابع دیتابیس (add_new_customer, log_interaction, get_customer_info) دسترسی دارید. "
-        "**قوانین:** 1. هرگاه داده‌های اجباری برای یک تابع (مثل نام و تلفن برای add_new_customer) جمع‌آوری شد، فوراً آن تابع را فراخوانی کنید. 2. همیشه پاسخ های خود را به زبان فارسی و دوستانه بنویسید."
+        "شما یک دستیار هوشمند CRM با **حافظه کامل و تحلیلگر هوشمند** هستید. "
+        "وظایف شما: ۱. ثبت و به‌روزرسانی دقیق داده‌ها، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
+        "۲. ارائه گزارش هوشمند و فیلتر شده (قابلیت ۴). "
+        "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی (قابلیت ۷):** پس از اجرای موفقیت‌آمیز هر تابع **ثبت**، باید داده‌های جدید و تاریخچه را تحلیل کنید و **به صورت یک پاراگراف جداگانه**، یک پیشنهاد عملی (Actionable Advice) برای پیگیری بعدی یا بهبود روند فروش ارائه دهید (مانند بهترین زمان تماس، پیشنهادات رقابتی، یا مراحل بعدی). "
+        "**قوانین:** 1. هرگاه داده‌های اجباری برای یک تابع جمع‌آوری شد، آن را فراخوانی کنید. 2. همیشه پاسخ های خود را به زبان فارسی و دوستانه بنویسید. 3. در فراخوانی تابع set_reminder، 'chat_id' را برابر با **" + str(chat_id) + "** قرار دهید."
     )
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='TYPING')
+    await context.bot.send_chat_action(chat_id=chat_id, action='TYPING')
     
     try:
         # مرحله ۱: ارسال درخواست با تاریخچه مکالمه
@@ -258,18 +401,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             contents=conversation_history, 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                tools=[add_new_customer, log_interaction, get_customer_info]
+                tools=[manage_customer_data, log_interaction, set_reminder, get_report] # لیست توابع جدید
             )
         )
         
         # --- تحلیل پاسخ هوش مصنوعی ---
-        
-        # ۱. اگر هوش مصنوعی خواست یک تابع را اجرا کند (Function Call)
         if response.function_calls:
             function_calls = response.function_calls
             tool_responses = []
             
-            # ذخیره فراخوانی تابع AI در تاریخچه
             context.user_data['history'].append(types.Content(role="model", parts=[types.Part.from_function_calls(function_calls)]))
             
             for call in function_calls:
@@ -277,12 +417,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 args = dict(call.args)
                 
                 # اجرای تابع مورد نظر
-                if function_name == 'add_new_customer':
-                    tool_result = add_new_customer(**args)
+                if function_name == 'manage_customer_data':
+                    tool_result = manage_customer_data(**args)
                 elif function_name == 'log_interaction':
                     tool_result = log_interaction(**args)
-                elif function_name == 'get_customer_info':
-                    tool_result = get_customer_info(**args)
+                elif function_name == 'set_reminder':
+                    # تزریق chat_id به آرگومان‌های تابع
+                    if 'chat_id' not in args: args['chat_id'] = chat_id 
+                    tool_result = set_reminder(**args)
+                elif function_name == 'get_report':
+                    tool_result = get_report(**args)
                 else:
                     tool_result = f"خطا: تابع {function_name} ناشناخته است."
                     
@@ -293,32 +437,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 )
 
-            # ذخیره نتیجه اجرای توابع در تاریخچه
             context.user_data['history'].append(types.Content(role="tool", parts=tool_responses))
             
-            # مرحله ۲: ارسال نتیجه و تاریخچه به‌روز شده به Gemini برای تولید پاسخ نهایی
+            # مرحله ۲: ارسال نتیجه به Gemini برای تولید پاسخ نهایی (شامل تحلیل هوشمند)
             final_response = ai_client.models.generate_content(
                 model=AI_MODEL,
                 contents=context.user_data['history'], 
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    tools=[add_new_customer, log_interaction, get_customer_info]
+                    tools=[manage_customer_data, log_interaction, set_reminder, get_report]
                 )
             )
             
-            # ذخیره پاسخ نهایی AI در تاریخچه
-            # [اصلاح ایمنی] بررسی کنید که آیا کاندیداها و محتوا وجود دارد
             if final_response.candidates and final_response.candidates[0].content:
                 context.user_data['history'].append(final_response.candidates[0].content)
 
-            await update.message.reply_text(final_response.text)
+            await update.message.reply_text(final_response.text, parse_mode='Markdown')
 
-        # ۲. اگر هوش مصنوعی مستقیماً پاسخ داد (بدون نیاز به دیتابیس)
         else:
             # ذخیره پاسخ مستقیم AI در تاریخچه
             if response.candidates and response.candidates[0].content:
                 context.user_data['history'].append(response.candidates[0].content)
-            await update.message.reply_text(response.text)
+            await update.message.reply_text(response.text, parse_mode='Markdown')
 
     except APIError as e:
         logger.error(f"Gemini API Error: {e}")
@@ -328,28 +468,34 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❓ یک خطای نامشخص رخ داد. لطفاً لاگ‌های سرور را بررسی کنید. خطا: {e}")
 
 
-# --- توابع هندلر کمکی (اختیاری) ---
+# --- توابع هندلر کمکی ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """پاسخ به دستور /start و راهنمایی اولیه."""
     init_db() 
     
-    # برای شروع مکالمه جدید، تاریخچه را پاک کنید
     if 'history' in context.user_data:
         del context.user_data['history']
         
     ai_status = "✅ متصل و آماده" if ai_client else "❌ غیرفعال (کلید API را بررسی کنید)."
     
+    # تعریف دکمه‌های ریپلای برای سهولت کار (قابلیت ۶)
+    reply_keyboard = [
+        ["✍️ ثبت اطلاعات جدید", "📞 ثبت گزارش تماس"],
+        ["📊 درخواست گزارش هوشمند", "📥 ارسال فایل کل مشتریان"],
+    ]
+    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
+    
     message = (
-        f"🤖 **CRM Bot هوشمند با حافظه کامل (Free-Form)**\n\n"
+        f"🤖 **CRM Bot هوشمند با تحلیل و حافظه کامل**\n\n"
         f"✨ وضعیت AI: {ai_status}\n"
-        f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید. من پیام‌های شما را به صورت پیوسته به خاطر می‌سپارم و نیت شما را درک می‌کنم.\n\n"
-        f"**مثال‌ها:**\n"
-        f" - **ثبت:** 'با آقای نوری صحبت کردم. تلفنش ۰۹۱۱۱۰۰۰۰۰۱ بود.'\n"
-        f" - **ادامه ثبت:** 'شرکتشون سمنان بتنه و خدمات اینستاگرام بهش دادیم.'\n"
-        f" - **گزارش:** 'حالا گزارش کامل نوری رو بهم بده.'\n"
+        f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
+        f"**مثال‌های هوشمند:**\n"
+        f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
+        ff" - **هشدار:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.'\n"
     )
-    await update.message.reply_text(message)
+    
+    await update.message.reply_text(message, reply_markup=markup, parse_mode='Markdown')
 
 # --- تابع اصلی اجرا (Main Execution Function) ---
 
@@ -363,11 +509,16 @@ def main() -> None:
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+        
+        # اجرای وظیفه بک‌گراند هشدار
+        application.job_queue.run_once(
+            lambda context: asyncio.create_task(reminder_checker(application)),
+            0
+        )
 
         url_path = TELEGRAM_BOT_TOKEN 
         webhook_url = f"{RENDER_EXTERNAL_URL}/{url_path}"
         
-        # [اصلاح پورت] استفاده از PORT که در ابتدای فایل تعریف شده است (پیش‌فرض 8000)
         logger.info(f"Setting up Webhook at {webhook_url} on port {PORT}")
 
         application.run_webhook(
@@ -389,6 +540,12 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    # اجرای وظیفه بک‌گراند هشدار (با استفاده از thread در Polling)
+    application.job_queue.run_once(
+        lambda context: asyncio.create_task(reminder_checker(application)),
+        0
+    )
 
     logger.info("Starting Memory-Enabled Free-Form CRM Bot (Polling Mode)...")
     application.run_polling(poll_interval=3.0)
