@@ -83,7 +83,7 @@ def init_db():
         )
     """)
     
-    # جدول هشدارها (Reminders Table) برای قابلیت ۳
+    # جدول هشدارها (Reminders Table)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -325,10 +325,10 @@ async def reminder_checker(application: Application):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # حذف ثانیه‌ها برای افزایش احتمال تطبیق با مقادیر دیتابیس
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M") 
         
         # جستجوی هشدارهایی که زمان آنها رسیده و هنوز ارسال نشده‌اند
-        # استفاده از LIKE برای تطبیق با تاریخ کامل یا فقط تاریخ
         cursor.execute("""
             SELECT id, chat_id, customer_name, reminder_text 
             FROM reminders 
@@ -368,8 +368,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if user_text.strip() == "📥 ارسال فایل کل مشتریان":
         await export_data_to_file(update, context)
         return
-    
-    # برای سایر دکمه‌ها، صرفاً متن را به هوش مصنوعی می‌فرستیم تا تصمیم بگیرد (مثلاً برای "ثبت اطلاعات جدید")
     
     # --- 1. مدیریت حافظه مکالمه (Conversation History) ---
     if 'history' not in context.user_data:
@@ -486,13 +484,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
     
+    # اصلاح Syntax Error در تعریف پیام
     message = (
         f"🤖 **CRM Bot هوشمند با تحلیل و حافظه کامل**\n\n"
         f"✨ وضعیت AI: {ai_status}\n"
         f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
         f"**مثال‌های هوشمند:**\n"
         f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
-        ff" - **هشدار:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.'\n"
+        f" - **هشدار:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.'\n"
     )
     
     await update.message.reply_text(message, reply_markup=markup, parse_mode='Markdown')
@@ -510,7 +509,8 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
-        # اجرای وظیفه بک‌گراند هشدار
+        # اجرای وظیفه بک‌گراند هشدار (با استفاده از Job Queue)
+        # زمان اجرای اولیه (0) به معنای بلافاصله پس از شروع برنامه است.
         application.job_queue.run_once(
             lambda context: asyncio.create_task(reminder_checker(application)),
             0
@@ -541,7 +541,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    # اجرای وظیفه بک‌گراند هشدار (با استفاده از thread در Polling)
+    # اجرای وظیفه بک‌گراند هشدار 
     application.job_queue.run_once(
         lambda context: asyncio.create_task(reminder_checker(application)),
         0
