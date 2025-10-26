@@ -1,9 +1,8 @@
 import os
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
-import re
 
 from telegram import Update
 from telegram.ext import (
@@ -24,10 +23,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # =================================================================
-# --- متغیرهای حیاتی (حتماً مقادیر زیر را جایگزین کنید) ---
-TELEGRAM_BOT_TOKEN = "8214825665:AAFCZeAnZjU0VMTnburJ9jUT9Dpar0ITexI" 
-GEMINI_API_KEY = "AIzaSyAcpAoDSsGtSwUEadLBAmChdbABAqEIkVo"          
+# --- متغیرهای حیاتی و محیطی (Environment Variables) ---
+# در Render، این مقادیر از طریق متغیرهای محیطی (OS) تنظیم می شوند
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
 DB_FILE = "crm_free_form_data.db" 
+
+# متغیرهای Webhook/Render
+PORT = int(os.environ.get('PORT', '8000')) 
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 # =================================================================
 
 # --- آماده‌سازی هوش مصنوعی (AI Setup) و ثابت‌ها ---
@@ -35,16 +39,17 @@ ai_client = None
 AI_MODEL = 'gemini-2.5-flash'
 TODAY_DATE = datetime.now().strftime("%Y-%m-%d")
 
-if TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN_HERE" and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
+if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info("Gemini Client and Model Initialized Successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize Gemini Client: {e}")
 else:
-    logger.warning("Using placeholder tokens. AI client initialization skipped. Replace tokens to enable AI.")
+    logger.warning("GEMINI_API_KEY not set. AI client initialization skipped.")
 
-# --- ساختار پایگاه داده (SQLite) و توابع مدیریت داده ---
+
+# --- توابع دیتابیس (SQLite) ---
 
 def init_db():
     """ایجاد یا اتصال به دیتابیس و ساخت جداول مورد نیاز."""
@@ -86,9 +91,9 @@ def add_new_customer(name: str, phone: str, company: str = None, industry: str =
     """
     برای ثبت یک مشتری جدید در دیتابیس استفاده می شود. نام و شماره تلفن الزامی هستند. 
     اگر مشتری با این نام و شماره قبلا وجود داشته باشد، خطا بازگردانده می شود.
+    Gemini باید قبل از فراخوانی مطمئن شود که نام و تلفن در دسترس است.
     """
     if not name or not phone:
-        # این نباید توسط Gemini اجرا شود زیرا در پرامپت کنترل شده
         return "خطا: نام و شماره تلفن برای ثبت مشتری جدید الزامی هستند."
     
     conn = sqlite3.connect(DB_FILE)
@@ -96,7 +101,7 @@ def add_new_customer(name: str, phone: str, company: str = None, industry: str =
     crm_user_id = 0 
 
     try:
-        # جایگزینی مقادیر Null با رشته خالی یا 'نامشخص'
+        # جایگزینی مقادیر Null با None برای دیتابیس
         company = company if company else None
         industry = industry if industry else None
         services = services if services else None
@@ -175,7 +180,6 @@ def get_customer_info(name_or_industry: str, info_type: str = "full_report") -> 
         return "\n".join(output)
         
     elif info_type == 'industry_list':
-        # ... (منطق بدون تغییر نسبت به نسخه قبل) ...
         cursor.execute("SELECT name, phone, company FROM customers WHERE industry LIKE ?", ('%' + name_or_industry + '%',))
         customers = cursor.fetchall()
         
@@ -188,7 +192,6 @@ def get_customer_info(name_or_industry: str, info_type: str = "full_report") -> 
         return "\n".join(output)
 
     elif info_type == 'chance_analysis':
-        # ... (منطق بدون تغییر نسبت به نسخه قبل) ...
         cursor.execute("SELECT name FROM customers")
         all_customers = [row[0] for row in cursor.fetchall()]
         
@@ -217,7 +220,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """
     
     if not ai_client:
-        await update.message.reply_text("❌ سرویس هوش مصنوعی غیرفعال است. لطفا با ادمین تماس بگیرید.")
+        await update.message.reply_text("❌ سرویس هوش مصنوعی غیرفعال است.")
         return
 
     user_text = update.message.text
@@ -226,8 +229,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
+    # [اصلاح نهایی] استفاده مستقیم از متن (String) به عنوان Part برای جلوگیری از TypeError
+    user_part = user_text 
+    
     # افزودن پیام جدید کاربر به تاریخچه
-    user_part = genai.types.Part.from_text(user_text)
     context.user_data['history'].append(genai.types.Content(role="user", parts=[user_part]))
     
     conversation_history = context.user_data['history']
@@ -343,20 +348,42 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --- تابع اصلی اجرا (Main Execution Function) ---
 
 def main() -> None:
-    """شروع به کار ربات."""
+    """شروع به کار ربات (با منطق انتخاب Webhook یا Polling)"""
     init_db() 
     
+    # بررسی Webhook (برای Render)
+    if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        # --- اجرای Webhook ---
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+        url_path = TELEGRAM_BOT_TOKEN 
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{url_path}"
+        
+        logger.info(f"Setting up Webhook at {webhook_url} on port {PORT}")
+
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=url_path,
+            webhook_url=webhook_url
+        )
+        logger.info("Webhook set up successfully. Bot is running on Render.")
+        return
+
+    # --- اجرای Polling (برای تست لوکال) ---
+    logger.warning("RENDER_EXTERNAL_URL not set or Token not defined. Running in polling mode (for local testing).")
+    
     if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        logger.error("TELEGRAM_BOT_TOKEN is a placeholder. Please set the correct value.")
+        logger.error("TELEGRAM_BOT_TOKEN is a placeholder. Cannot run bot.")
         return
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    logger.info("Starting Memory-Enabled Free-Form CRM Bot...")
-    
+    logger.info("Starting Memory-Enabled Free-Form CRM Bot (Polling Mode)...")
     application.run_polling(poll_interval=3.0)
     
 if __name__ == "__main__":
