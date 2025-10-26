@@ -15,7 +15,7 @@ from telegram.ext import (
 from google import genai
 from google.genai.errors import APIError
 
-# --- تنظیمات ا لاگ‌گیری (Logging) ---
+# --- تنظیمات لاگ‌گیری (Logging) ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
