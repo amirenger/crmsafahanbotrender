@@ -1,14 +1,11 @@
 import os
 import logging
-import sqlite3
 from datetime import datetime
 import json
-import asyncio 
-
-# --- اصلاح خطای ImportError: ChatAction از telegram.constants وارد شد ---
+import asyncio
+import gspread # <--- جدید
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.constants import ChatAction 
-
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -17,7 +14,7 @@ from telegram.ext import (
     CommandHandler,
 )
 from google import genai
-from google.genai import types 
+from google.genai import types
 from google.genai.errors import APIError
 
 # --- تنظیمات لاگ‌گیری ---
@@ -31,11 +28,12 @@ logger = logging.getLogger(__name__)
 # --- متغیرهای حیاتی و محیطی ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
-DB_FILE = "crm_free_form_data.db" 
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID") # <--- جدید
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS") # <--- جدید
 
 # متغیرهای Webhook/Render
-PORT = int(os.environ.get('PORT', '8000')) 
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+PORT = int(os.environ.get('PORT', '8000'))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 # =================================================================
 
 # --- آماده‌سازی هوش مصنوعی و ثابت‌ها ---
@@ -43,235 +41,233 @@ ai_client = None
 AI_MODEL = 'gemini-2.5-flash'
 TODAY_DATE = datetime.now().strftime("%Y-%m-%d")
 
-if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
+# --- آماده‌سازی Google Sheets ---
+CUSTOMER_SHEET_NAME = "Customers"
+INTERACTION_SHEET_NAME = "Interactions"
+REMINDER_SHEET_NAME = "Reminders"
+gs_client = None
+gs_customer_sheet = None
+gs_interaction_sheet = None
+gs_reminder_sheet = None
+
+# --- توابع اتصال و آماده سازی Sheets ---
+
+def init_sheets():
+    """اتصال به Google Sheets و باز کردن ورک‌شیت‌ها."""
+    global gs_client, gs_customer_sheet, gs_interaction_sheet, gs_reminder_sheet
+    
+    if not GOOGLE_SHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+        logger.error("Google Sheet ID or Credentials not set. Persistent memory disabled.")
+        return False
+        
     try:
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("Gemini Client and Model Initialized Successfully.")
+        # Load credentials from environment variable
+        creds = json.loads(GOOGLE_CREDENTIALS_JSON)
+        
+        # Authenticate with gspread
+        gs_client = gspread.service_account_from_dict(creds)
+        spreadsheet = gs_client.open_by_key(GOOGLE_SHEET_ID)
+        
+        # Initialize worksheets
+        try:
+            gs_customer_sheet = spreadsheet.worksheet(CUSTOMER_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            gs_customer_sheet = spreadsheet.add_worksheet(title=CUSTOMER_SHEET_NAME, rows=1000, cols=7)
+            gs_customer_sheet.append_row(["ID", "Name", "Phone", "Company", "Industry", "Services", "CRM User ID"])
+
+        try:
+            gs_interaction_sheet = spreadsheet.worksheet(INTERACTION_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            gs_interaction_sheet = spreadsheet.add_worksheet(title=INTERACTION_SHEET_NAME, rows=1000, cols=5)
+            gs_interaction_sheet.append_row(["Interaction ID", "Customer Name", "Interaction Date", "Report", "Follow Up Date"])
+
+        try:
+            gs_reminder_sheet = spreadsheet.worksheet(REMINDER_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            gs_reminder_sheet = spreadsheet.add_worksheet(title=REMINDER_SHEET_NAME, rows=1000, cols=6)
+            gs_reminder_sheet.append_row(["Reminder ID", "Chat ID", "Customer Name", "Reminder Text", "Due Date Time", "Sent"])
+
+        logger.info("Google Sheets Client Initialized Successfully. Persistent memory is now ON.")
+        return True
+        
     except Exception as e:
-        logger.error(f"Failed to initialize Gemini Client: {e}")
-else:
-    logger.warning("GEMINI_API_KEY not set. AI client initialization skipped.")
+        logger.error(f"Failed to initialize Google Sheets: {e}")
+        return False
 
-
-# --- توابع دیتابیس (SQLite) ---
-
-def init_db():
-    """ایجاد یا اتصال به دیتابیس و ساخت جداول مورد نیاز."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # جدول مشتریان (Customer Table)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS customers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            company TEXT,
-            industry TEXT,
-            services TEXT,
-            crm_user_id INTEGER DEFAULT 0,
-            UNIQUE(name, phone)
-        )
-    """)
-    
-    # جدول تعاملات (Interactions Table)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS interactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER NOT NULL,
-            interaction_date TEXT NOT NULL,
-            report TEXT NOT NULL,
-            follow_up_date TEXT,
-            FOREIGN KEY (customer_id) REFERENCES customers(id)
-        )
-    """)
-    
-    # جدول هشدارها (Reminders Table)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS reminders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            customer_name TEXT,
-            reminder_text TEXT NOT NULL,
-            due_date_time TEXT NOT NULL,
-            sent INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info(f"Free-Form CRM Database {DB_FILE} initialized.")
-
-# =================================================================
 # --- توابع (Functions) که هوش مصنوعی به آنها دسترسی دارد (Tools) ---
-# =================================================================
+# توابع زیر اکنون با Google Sheets کار می‌کنند.
+
+def find_customer_row(name: str, phone: str = None) -> (dict, int):
+    """جستجوی مشتری بر اساس نام و/یا تلفن و بازگرداندن دیکشنری داده‌ها و شماره سطر."""
+    if not gs_customer_sheet: return None, None
+    
+    # برای جستجو، تمام رکوردهای مشتریان را می‌خوانیم
+    data = gs_customer_sheet.get_all_records()
+    
+    for index, row in enumerate(data):
+        # gspread index: index + 2 (Header row + 1-based index)
+        row_num = index + 2 
+        
+        # تطبیق نام (case-insensitive)
+        name_match = row['Name'].strip().lower() == name.strip().lower()
+        
+        # اگر تلفن داده شده، باید آن هم تطبیق یابد
+        phone_match = True
+        if phone:
+            phone_match = row['Phone'].strip() == phone.strip()
+
+        if name_match and phone_match:
+            return row, row_num
+            
+    # اگر فقط با نام تطبیق دهیم
+    if not phone:
+        for index, row in enumerate(data):
+            row_num = index + 2
+            if row['Name'].strip().lower() == name.strip().lower():
+                 return row, row_num
+                 
+    return None, None
+
 
 def manage_customer_data(name: str, phone: str, company: str = None, industry: str = None, services: str = None) -> str:
-    """
-    برای ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود استفاده می‌شود. (قابلیت ۱ و ۲)
-    اگر مشتری با نام و تلفن وجود داشته باشد، اطلاعات غیرخالی آن به‌روز می‌شود. نام و تلفن الزامی هستند.
-    """
+    """ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود. (قابلیت ۱ و ۲)"""
+    if not gs_customer_sheet:
+        return "خطا: سرویس حافظه دائمی (Google Sheets) فعال نیست."
     if not name or not phone:
         return "خطا: نام و شماره تلفن برای ثبت یا به‌روزرسانی مشتری الزامی هستند."
+
+    customer, row_num = find_customer_row(name, phone)
     
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    # 1. جستجوی مشتری موجود
-    cursor.execute("SELECT id FROM customers WHERE name = ? AND phone = ?", (name, phone))
-    existing_customer = cursor.fetchone()
-
-    if existing_customer:
-        customer_id = existing_customer[0]
-        updates = []
-        params = []
-        if company:
-            updates.append("company = ?")
-            params.append(company)
-        if industry:
-            updates.append("industry = ?")
-            params.append(industry)
-        if services:
-            updates.append("services = ?")
-            params.append(services)
+    if customer:
+        # به‌روزرسانی مشتری موجود
+        updates = {}
+        if company and company != customer['Company']: updates['Company'] = company
+        if industry and industry != customer['Industry']: updates['Industry'] = industry
+        if services and services != customer['Services']: updates['Services'] = services
         
         if updates:
-            query = f"UPDATE customers SET {', '.join(updates)} WHERE id = ?"
-            params.append(customer_id)
-            cursor.execute(query, tuple(params))
-            conn.commit()
-            conn.close()
-            return f"اطلاعات مشتری '{name}' (ID: {customer_id}) با موفقیت به‌روزرسانی شد."
+            # ستون‌های قابل به‌روزرسانی: Company (4), Industry (5), Services (6)
+            headers = gs_customer_sheet.row_values(1)
+            
+            for key, value in updates.items():
+                col_index = headers.index(key) + 1 # 1-based index
+                gs_customer_sheet.update_cell(row_num, col_index, value)
+            
+            return f"اطلاعات مشتری '{name}' (ID: {customer['ID']}) با موفقیت به‌روزرسانی شد."
         else:
-            conn.close()
-            return f"مشتری '{name}' (ID: {customer_id}) قبلاً ثبت شده و اطلاعات جدیدی برای به‌روزرسانی وجود نداشت."
+            return f"مشتری '{name}' (ID: {customer['ID']}) قبلاً ثبت شده و اطلاعات جدیدی برای به‌روزرسانی وجود نداشت."
     else:
-        # 2. ثبت مشتری جدید
-        crm_user_id = 0 
+        # ثبت مشتری جدید
+        
+        # تولید ID جدید بر اساس آخرین سطر
+        all_ids = gs_customer_sheet.col_values(1)[1:] 
+        new_id = int(all_ids[-1]) + 1 if all_ids and all_ids[-1].isdigit() else 1
+        
         try:
-            cursor.execute("""
-                INSERT INTO customers (name, phone, company, industry, services, crm_user_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, phone, company, industry, services, crm_user_id))
-            conn.commit()
-            customer_id = cursor.lastrowid
-            conn.close()
-            return f"عملیات ثبت مشتری موفق بود. مشتری '{name}' (ID: {customer_id}) با موفقیت ثبت شد."
-        except sqlite3.IntegrityError:
-            conn.close()
-            return f"خطا: مشتری با نام '{name}' و شماره '{phone}' قبلا در سیستم ثبت شده است."
+            new_row = [new_id, name, phone, company or '', industry or '', services or '', 0]
+            gs_customer_sheet.append_row(new_row)
+            return f"عملیات ثبت مشتری موفق بود. مشتری '{name}' (ID: {new_id}) با موفقیت ثبت شد."
         except Exception as e:
-            conn.close()
-            return f"خطای ناشناخته در ثبت مشتری: {e}"
+            return f"خطای ناشناخته در ثبت مشتری در شیت: {e}"
 
 
 def log_interaction(customer_name: str, interaction_report: str, follow_up_date: str = None) -> str:
-    """
-    برای ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود استفاده می شود. (قابلیت ۲)
-    اگر تاریخ پیگیری به صورت 'هفته آینده' یا 'ماه بعد' باشد، Gemini باید آن را به فرمت YYYY-MM-DD تبدیل کند.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    """ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود. (قابلیت ۲)"""
+    if not gs_interaction_sheet:
+        return "خطا: سرویس حافظه دائمی (Google Sheets) فعال نیست."
+        
+    customer, _ = find_customer_row(customer_name)
     
-    cursor.execute("SELECT id FROM customers WHERE name = ? COLLATE NOCASE", (customer_name,))
-    result = cursor.fetchone()
-    
-    if not result:
-        conn.close()
+    if not customer:
         return f"خطا: مشتری با نام '{customer_name}' در دیتابیس پیدا نشد. لطفا ابتدا او را ثبت کنید."
 
-    customer_id = result[0]
-    
-    cursor.execute("""
-        INSERT INTO interactions (customer_id, interaction_date, report, follow_up_date)
-        VALUES (?, ?, ?, ?)
-    """, (customer_id, TODAY_DATE, interaction_report, follow_up_date))
-    conn.commit()
-    conn.close()
-    
-    follow_up_msg = f"پیگیری بعدی برای تاریخ {follow_up_date} تنظیم شد." if follow_up_date else ""
-    return f"گزارش تماس با '{customer_name}' با موفقیت ثبت شد. {follow_up_msg}"
+    try:
+        # تولید ID جدید بر اساس آخرین سطر
+        all_ids = gs_interaction_sheet.col_values(1)[1:] 
+        new_id = int(all_ids[-1]) + 1 if all_ids and all_ids[-1].isdigit() else 1
+        
+        new_row = [
+            new_id, 
+            customer_name, 
+            TODAY_DATE, 
+            interaction_report, 
+            follow_up_date or ''
+        ]
+        gs_interaction_sheet.append_row(new_row)
+        
+        follow_up_msg = f"پیگیری بعدی برای تاریخ {follow_up_date} تنظیم شد." if follow_up_date else ""
+        return f"گزارش تماس با '{customer_name}' با موفقیت در Google Sheets ثبت شد. {follow_up_msg}"
+    except Exception as e:
+        return f"خطا در ثبت گزارش تعامل در شیت: {e}"
 
 
 def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id: int) -> str:
-    """
-    برای تنظیم یک یادآوری یا هشدار در مورد مشتری یا هر رویداد دیگری استفاده می شود. (قابلیت ۳)
-    تاریخ و زمان باید به فرمت دقیق 'YYYY-MM-DD HH:MM:SS' یا 'YYYY-MM-DD' توسط Gemini تبدیل شوند.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    """ثبت یک یادآوری یا هشدار. (قابلیت ۳)"""
+    if not gs_reminder_sheet:
+        return "خطا: سرویس حافظه دائمی (Google Sheets) فعال نیست."
     try:
-        cursor.execute("""
-            INSERT INTO reminders (chat_id, customer_name, reminder_text, due_date_time)
-            VALUES (?, ?, ?, ?)
-        """, (chat_id, customer_name, reminder_text, date_time))
-        conn.commit()
-        return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت ثبت شد."
+        # تولید ID جدید
+        all_ids = gs_reminder_sheet.col_values(1)[1:] 
+        new_id = int(all_ids[-1]) + 1 if all_ids and all_ids[-1].isdigit() else 1
+        
+        new_row = [new_id, chat_id, customer_name, reminder_text, date_time, 0] # 0 for Sent status (Not Sent)
+        gs_reminder_sheet.append_row(new_row)
+        
+        return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت در Google Sheets ثبت شد."
     except Exception as e:
-        return f"خطا در ثبت هشدار: {e}"
-    finally:
-        conn.close()
+        return f"خطا در ثبت هشدار در شیت: {e}"
 
 
 def get_report(query_type: str, search_term: str = None, fields: str = "all") -> str:
-    """
-    برای دریافت گزارش یا اطلاعات خاصی از مشتریان (مانند گزارش هوشمند صنفی) استفاده می شود. (قابلیت ۴)
-    query_type می تواند: 'full_customer' (گزارش کامل یک مشتری), 'industry_search' (جستجوی مشتریان یک صنف), یا 'interaction_summary' (خلاصه تعاملات).
-    fields یک رشته است که فیلدهای مورد نیاز را با کاما جدا می کند (مثلاً 'name,phone,company').
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    output = []
+    """دریافت گزارش یا اطلاعات خاصی از مشتریان. (قابلیت ۴)"""
+    if not gs_customer_sheet or not gs_interaction_sheet:
+        return "خطا: سرویس حافظه دائمی (Google Sheets) فعال نیست."
+        
+    customer_data = gs_customer_sheet.get_all_records()
     
     if query_type == 'industry_search' and search_term:
-        field_names = [f.strip() for f in fields.split(',')]
+        results = []
+        field_names = [f.strip() for f in fields.split(',')] if fields != "all" else ["Name", "Phone", "Company", "Industry"]
         
-        # اگر فیلدهای خاصی خواسته نشده، فقط نام و تلفن را بگیرید
-        select_fields = ", ".join(field_names) if fields != "all" else "name, phone, company, industry"
-        
-        cursor.execute(f"SELECT {select_fields} FROM customers WHERE industry LIKE ?", ('%' + search_term + '%',))
-        customers = cursor.fetchall()
-        
-        if not customers:
+        for customer in customer_data:
+            if search_term.lower() in str(customer.get('Industry', '')).lower():
+                row_data = [str(customer.get(field, '')) for field in field_names]
+                results.append(" | ".join(row_data))
+                
+        if not results:
             return f"هیچ مشتری در حوزه '{search_term}' پیدا نشد."
             
-        output.append(f"مشتریان در حوزه '{search_term}' (فیلدهای: {select_fields}):\n")
-        # اضافه کردن هدر جدول برای خوانایی
-        if fields == "all":
-             output.append(" | ".join(["نام", "تلفن", "شرکت", "صنعت"]))
-             output.append("-" * 50)
-        
-        for row in customers:
-            output.append(" | ".join([str(item) for item in row]))
-            
-        conn.close()
+        output = [f"مشتریان در حوزه '{search_term}' (فیلدهای: {', '.join(field_names)}):\n", " | ".join(field_names), "-" * 50]
+        output.extend(results)
         return "\n".join(output)
         
     elif query_type == 'full_customer' and search_term:
-        # منطق گزارش کامل مشتری (مثل نسخه قبلی)
-        cursor.execute("SELECT * FROM customers WHERE name = ? COLLATE NOCASE", (search_term,))
-        customer = cursor.fetchone()
+        customer, _ = find_customer_row(search_term)
         
         if not customer:
-            conn.close()
             return f"خطا: مشتری با نام '{search_term}' پیدا نشد."
             
-        keys = ["ID", "نام", "تلفن", "شرکت", "حوزه کاری", "خدمات مورد نظر", "CRM User ID"]
-        output.append("جزئیات مشتری:\n" + json.dumps(dict(zip(keys, customer)), ensure_ascii=False, indent=2))
+        output = ["جزئیات مشتری (از Google Sheets):\n" + json.dumps(customer, ensure_ascii=False, indent=2)]
 
-        cursor.execute("SELECT interaction_date, report, follow_up_date FROM interactions WHERE customer_id = ?", (customer[0],))
-        interactions = cursor.fetchall()
+        # جستجوی تعاملات
+        interaction_data = gs_interaction_sheet.get_all_records()
+        interactions = [
+            i for i in interaction_data 
+            if str(i.get('Customer Name', '')).strip().lower() == search_term.strip().lower()
+        ]
         
         if interactions:
             output.append("\nگزارشات تعامل:\n")
-            for date, report, follow_up in interactions:
-                output.append(f"  - تاریخ: {date}, پیگیری: {follow_up or 'ندارد'}\n    خلاصه: {report[:100]}...")
+            for interaction in interactions:
+                date = interaction.get('Interaction Date', '')
+                report = interaction.get('Report', '')
+                follow_up = interaction.get('Follow Up Date', 'ندارد')
+                output.append(f"  - تاریخ: {date}, پیگیری: {follow_up}\n    خلاصه: {report[:100]}...")
         else:
             output.append("هیچ گزارش تعاملی ثبت نشده است.")
         
-        conn.close()
         return "\n".join(output)
         
-    conn.close()
     return f"نوع گزارش '{query_type}' پشتیبانی نمی‌شود یا عبارت جستجو مشخص نیست."
 
 # =================================================================
@@ -279,45 +275,41 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
 # =================================================================
 
 async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    تولید فایل CSV از اطلاعات کامل مشتریان و ارسال آن به کاربر (قابلیت ۵).
-    این تابع مستقیماً توسط دکمه تلگرام فراخوانی می‌شود و به Function Calling ربطی ندارد.
-    """
+    """تولید فایل CSV از اطلاعات کامل مشتریان و ارسال آن به کاربر (قابلیت ۵)."""
+    if not gs_customer_sheet:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ سرویس حافظه دائمی (Google Sheets) فعال نیست.")
+        return
+        
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
     
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM customers")
-    customers = cursor.fetchall()
-    
-    if not customers:
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ دیتابیس مشتریان خالی است. فایلی برای ارسال وجود ندارد.")
-        conn.close()
-        return
-
-    # تولید محتوای CSV
-    # تعریف هدرها به فارسی برای خوانایی بهتر
-    header_list = ["ID","نام","تلفن","شرکت","حوزه کاری","خدمات مورد نظر","CRM User ID"]
-    csv_content = [",".join(header_list)]
-    
-    for row in customers:
-        # جایگزینی کاما با نقطه ویرگول یا حذف آن برای جلوگیری از بهم ریختگی CSV
-        safe_row = [str(item).replace(',', ';') if item else '' for item in row]
-        csv_content.append(",".join(safe_row))
+    try:
+        # دریافت تمام داده‌ها شامل هدر (با متد get_all_values)
+        all_data = gs_customer_sheet.get_all_values()
         
-    file_name = f"CRM_Customers_Export_{TODAY_DATE}.csv"
-    
-    # ارسال فایل (با استفاده از utf-8 برای پشتیبانی از فارسی)
-    await context.bot.send_document(
-        chat_id=chat_id, 
-        document=bytes("\n".join(csv_content).encode('utf-8')),
-        filename=file_name,
-        caption="فایل کامل مشتریان CRM با فرمت CSV"
-    )
-    conn.close()
+        if len(all_data) <= 1: # فقط شامل هدر است
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ دیتابیس مشتریان خالی است. فایلی برای ارسال وجود ندارد.")
+            return
 
+        # تولید محتوای CSV
+        csv_content = []
+        for row in all_data:
+            # جایگزینی کاما با نقطه ویرگول برای جلوگیری از بهم ریختگی CSV
+            safe_row = [str(item).replace(',', ';') if item else '' for item in row]
+            csv_content.append(",".join(safe_row))
+            
+        file_name = f"CRM_Customers_Export_{TODAY_DATE}.csv"
+        
+        # ارسال فایل (با استفاده از utf-8 برای پشتیبانی از فارسی)
+        await context.bot.send_document(
+            chat_id=chat_id, 
+            document=bytes("\n".join(csv_content).encode('utf-8')),
+            filename=file_name,
+            caption="فایل کامل مشتریان CRM (حافظه دائمی Google Sheets) با فرمت CSV"
+        )
+    except Exception as e:
+        logger.error(f"Error exporting data from sheet: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ خطایی هنگام استخراج داده‌ها از Google Sheets رخ داد.")
 
 # =================================================================
 # --- وظیفه بک‌گراند برای هشدارها (قابلیت ۳) ---
@@ -325,45 +317,50 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def reminder_checker(application: Application):
     """وظیفه دوره‌ای برای بررسی و ارسال هشدارهای ثبت شده."""
+    if not gs_reminder_sheet:
+        logger.warning("Reminder checker skipped: Google Sheets not initialized.")
+        return
+        
     while True:
         await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک می‌کند
         
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        # حذف ثانیه‌ها برای افزایش احتمال تطبیق با مقادیر دیتابیس
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M") 
-        
-        # جستجوی هشدارهایی که زمان آنها رسیده و هنوز ارسال نشده‌اند
-        cursor.execute("""
-            SELECT id, chat_id, customer_name, reminder_text 
-            FROM reminders 
-            WHERE due_date_time LIKE ? || '%' AND sent = 0
-        """, (current_time_str[:16],)) # تطبیق تا دقیقه
-        
-        reminders = cursor.fetchall()
-        
-        for reminder_id, chat_id, customer_name, reminder_text in reminders:
-            try:
-                # ارسال پیام هشدار
-                message = f"🔔 **هشدار CRM**\n\nمشتری: **{customer_name or 'عمومی'}**\nپیام: _{reminder_text}_\n\n"
-                await application.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+        try:
+            # خواندن تمام داده‌های هشدارها
+            reminders_data = gs_reminder_sheet.get_all_records()
+            current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M") 
+            
+            for index, reminder in enumerate(reminders_data):
+                # gspread index: index + 2
+                row_num = index + 2 
                 
-                # به‌روزرسانی وضعیت ارسال
-                cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
-                conn.commit()
-            except Exception as e:
-                logger.error(f"Failed to send reminder {reminder_id} to {chat_id}: {e}")
+                # تطبیق زمان تا دقیقه و بررسی وضعیت ارسال
+                due_time = str(reminder.get('Due Date Time', ''))
+                sent_status = int(reminder.get('Sent', 0))
                 
-        conn.close()
+                if sent_status == 0 and due_time.startswith(current_time_str):
+                    
+                    chat_id = int(reminder.get('Chat ID', 0))
+                    customer_name = reminder.get('Customer Name', 'N/A')
+                    reminder_text = reminder.get('Reminder Text', 'N/A')
+
+                    # ارسال پیام هشدار
+                    message = f"🔔 **هشدار CRM**\n\nمشتری: **{customer_name or 'عمومی'}**\nپیام: _{reminder_text}_\n\n"
+                    await application.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                    
+                    # به‌روزرسانی وضعیت ارسال در ستون 'Sent' (ستون ۶)
+                    gs_reminder_sheet.update_cell(row_num, 6, 1) # Set Sent status to 1
+                    
+        except Exception as e:
+            logger.error(f"Failed to run reminder checker: {e}")
 
 # =================================================================
-# --- تابع اصلی هندلر پیام (Free-Form Handler) ---
+# --- تابع اصلی هندلر پیام و اجرا (Main Execution Function) ---
 # =================================================================
+
+# (تابع message_handler و start_command نیازی به تغییر عمده ندارند و همان منطق قبلی را دنبال می‌کنند)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هندلر اصلی برای پردازش پیام‌ها، Function Calling و تحلیل هوشمند (قابلیت ۷)."""
-    
+    # ... (کد message_handler عیناً مشابه نسخه قبلی) ...
     if not ai_client or not update.message or not update.message.text:
         return
 
@@ -375,20 +372,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await export_data_to_file(update, context)
         return
     
-    # --- 1. مدیریت حافظه مکالمه (Conversation History) ---
+    # --- ۱. مدیریت حافظه مکالمه (Conversation History) ---
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
     user_part = types.Part(text=user_text)
-    
-    # افزودن پیام جدید کاربر به تاریخچه
     context.user_data['history'].append(types.Content(role="user", parts=[user_part]))
-    
     conversation_history = context.user_data['history']
     
     # تعریف پرامپت سیستمی (System Instruction) (قابلیت ۷)
     system_instruction = (
-        "شما یک دستیار هوشمند CRM با **حافظه کامل و تحلیلگر هوشمند** هستید. "
+        "شما یک دستیار هوشمند CRM با **حافظه کامل (Google Sheets)** و تحلیلگر هوشمند هستید. "
         "وظایف شما: ۱. ثبت و به‌روزرسانی دقیق داده‌ها، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
         "۲. ارائه گزارش هوشمند و فیلتر شده (قابلیت ۴). "
         "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی (قابلیت ۷):** پس از اجرای موفقیت‌آمیز هر تابع **ثبت**، باید داده‌های جدید و تاریخچه را تحلیل کنید و **به صورت یک پاراگراف جداگانه**، یک پیشنهاد عملی (Actionable Advice) برای پیگیری بعدی یا بهبود روند فروش ارائه دهید (مانند بهترین زمان تماس، پیشنهادات رقابتی، یا مراحل بعدی). "
@@ -404,7 +398,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             contents=conversation_history, 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                tools=[manage_customer_data, log_interaction, set_reminder, get_report] # لیست توابع جدید
+                tools=[manage_customer_data, log_interaction, set_reminder, get_report]
             )
         )
         
@@ -412,26 +406,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if response.function_calls:
             function_calls = response.function_calls
             tool_responses = []
-            
             context.user_data['history'].append(types.Content(role="model", parts=[types.Part.from_function_calls(function_calls)]))
             
             for call in function_calls:
                 function_name = call.name
                 args = dict(call.args)
                 
-                # اجرای تابع مورد نظر
-                if function_name == 'manage_customer_data':
-                    tool_result = manage_customer_data(**args)
-                elif function_name == 'log_interaction':
-                    tool_result = log_interaction(**args)
+                if function_name == 'manage_customer_data': tool_result = manage_customer_data(**args)
+                elif function_name == 'log_interaction': tool_result = log_interaction(**args)
                 elif function_name == 'set_reminder':
-                    # تزریق chat_id به آرگومان‌های تابع
                     if 'chat_id' not in args: args['chat_id'] = chat_id 
                     tool_result = set_reminder(**args)
-                elif function_name == 'get_report':
-                    tool_result = get_report(**args)
-                else:
-                    tool_result = f"خطا: تابع {function_name} ناشناخته است."
+                elif function_name == 'get_report': tool_result = get_report(**args)
+                else: tool_result = f"خطا: تابع {function_name} ناشناخته است."
                     
                 tool_responses.append(
                     types.Part.from_function_response(
@@ -458,7 +445,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(final_response.text, parse_mode='Markdown')
 
         else:
-            # ذخیره پاسخ مستقیم AI در تاریخچه
             if response.candidates and response.candidates[0].content:
                 context.user_data['history'].append(response.candidates[0].content)
             await update.message.reply_text(response.text, parse_mode='Markdown')
@@ -471,28 +457,25 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❓ یک خطای نامشخص رخ داد. لطفاً لاگ‌های سرور را بررسی کنید. خطا: {e}")
 
 
-# --- توابع هندلر کمکی ---
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """پاسخ به دستور /start و راهنمایی اولیه."""
-    init_db() 
-    
+    # init_sheets() # فراخوانی در main انجام می شود
     if 'history' in context.user_data:
         del context.user_data['history']
         
     ai_status = "✅ متصل و آماده" if ai_client else "❌ غیرفعال (کلید API را بررسی کنید)."
+    sheet_status = "✅ متصل به Google Sheets" if gs_client else "❌ مشکل در اتصال به Google Sheets"
     
-    # تعریف دکمه‌های ریپلای برای سهولت کار (قابلیت ۶)
     reply_keyboard = [
         ["✍️ ثبت اطلاعات جدید", "📞 ثبت گزارش تماس"],
         ["📊 درخواست گزارش هوشمند", "📥 ارسال فایل کل مشتریان"],
     ]
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=False, resize_keyboard=True)
     
-    # اصلاح Syntax Error با استفاده از یک پرانتز برای اتصال خطوط
     message = (
-        f"🤖 **CRM Bot هوشمند با تحلیل و حافظه کامل**\n\n"
+        f"🤖 **CRM Bot هوشمند با حافظه دائمی Google Sheets**\n\n"
         f"✨ وضعیت AI: {ai_status}\n"
+        f"💾 وضعیت حافظه: {sheet_status}\n"
         f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
         f"**مثال‌های هوشمند:**\n"
         f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
@@ -501,20 +484,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.message.reply_text(message, reply_markup=markup, parse_mode='Markdown')
 
-# --- تابع اصلی اجرا (Main Execution Function) ---
 
 def main() -> None:
     """شروع به کار ربات (با منطق انتخاب Webhook یا Polling)"""
-    init_db() 
     
-    # بررسی Webhook (برای Render)
+    # --- ابتدا اتصال به Google Sheets را برقرار می کنیم ---
+    if not init_sheets():
+        logger.error("FATAL: Could not initialize Google Sheets. Bot cannot run without persistent memory.")
+        # اگر اتصال برقرار نشود، ربات اجرا نخواهد شد
+        # این باعث می شود Render وضعیت Down را نشان دهد، که هدف ما نیست، اما داده ها از دست نمی رود.
+        # برای ادامه کار، ما اجازه می دهیم تا application ساخته شود و خطا را در start_command نشان می دهیم.
+
+    # ... (بقیه کد main() مشابه نسخه قبلی) ...
+    
     if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         # --- اجرای Webhook ---
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
-        # اجرای وظیفه بک‌گراند هشدار (با رفع خطای AttributeError)
         if application.job_queue:
             application.job_queue.run_once(
                 lambda context: asyncio.create_task(reminder_checker(application)),
@@ -546,7 +534,6 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    # اجرای وظیفه بک‌گراند هشدار (با رفع خطای AttributeError)
     if application.job_queue:
         application.job_queue.run_once(
             lambda context: asyncio.create_task(reminder_checker(application)),
