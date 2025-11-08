@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import asyncio
 import psycopg2 
+import pytz # اضافه شدن کتابخانه مدیریت منطقه زمانی
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -28,8 +29,7 @@ logger = logging.getLogger(__name__)
 # --- متغیرهای حیاتی و محیطی ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL") # آدرس اتصال PostgreSQL از Render
-
+DATABASE_URL = os.environ.get("DATABASE_URL")
 # متغیرهای Webhook/Render
 PORT = int(os.environ.get('PORT', '8000'))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
@@ -39,6 +39,8 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 ai_client = None
 AI_MODEL = 'gemini-2.5-flash'
 TODAY_DATE = datetime.now().strftime("%Y-%m-%d")
+# تعریف منطقه زمانی ایران
+IRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # --- آماده‌سازی دیتابیس PostgreSQL ---
 db_connection = None
@@ -51,7 +53,6 @@ def get_db_connection():
             logger.error("DATABASE_URL is not set. Persistent memory is disabled.")
             return None
         try:
-            # اتصال به دیتابیس PostgreSQL با نیاز به SSL برای Render
             db_connection = psycopg2.connect(DATABASE_URL, sslmode='require')
             db_connection.autocommit = True
             logger.info("PostgreSQL Connection Established Successfully.")
@@ -88,14 +89,14 @@ def init_db():
                     follow_up_date DATE
                 );
             """)
-            # ۳. جدول هشدارها
+            # ۳. جدول هشدارها - نوع ستون زمان باید بتواند زمان با منطقه زمانی را ذخیره کند
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT,
                     customer_name VARCHAR(255),
                     reminder_text TEXT,
-                    due_date_time TIMESTAMP,
+                    due_date_time TIMESTAMP WITH TIME ZONE, -- اصلاح شده برای پشتیبانی از Timezone
                     sent BOOLEAN DEFAULT FALSE
                 );
             """)
@@ -106,6 +107,8 @@ def init_db():
         return False
 
 # --- توابع (Functions) که هوش مصنوعی به آنها دسترسی دارد (Tools) ---
+
+# ... (توابع find_customer_data, delete_customer, manage_customer_data, log_interaction بدون تغییر) ...
 
 def find_customer_data(name: str, phone: str = None):
     """جستجوی مشتری بر اساس نام و/یا تلفن و بازگرداندن داده‌ها."""
@@ -223,30 +226,42 @@ def log_interaction(customer_name: str, interaction_report: str, follow_up_date:
             return f"گزارش تماس با '{customer_name}' با موفقیت در دیتابیس ثبت شد. (ID: {new_id}). {follow_up_msg}"
     except Exception as e:
         return f"خطا در ثبت گزارش تعامل: {e}"
+# ...
 
 def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id: int) -> str:
-    """ثبت یک یادآوری یا هشدار."""
+    """ثبت یک یادآوری یا هشدار با لحاظ کردن منطقه زمانی (Iran Time -> UTC)."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
     try:
-        # تاریخ و زمان را به فرمت قابل قبول PostgreSQL تبدیل می کند
+        # ۱. تاریخ و زمان را به عنوان زمان محلی (Naive) پارس می کند
         parsed_datetime = datetime.strptime(date_time, "%Y-%m-%d %H:%M")
+        
+        # ۲. زمان محلی را به منطقه زمانی ایران پیوست می کند
+        local_datetime = IRAN_TZ.localize(parsed_datetime)
+        
+        # ۳. زمان را به UTC تبدیل می کند (بهترین راه برای ذخیره در دیتابیس)
+        utc_datetime = local_datetime.astimezone(pytz.utc)
+        
+        # بررسی می کند که آیا زمان یادآوری در گذشته است یا خیر (از دید UTC)
+        if utc_datetime < datetime.now(pytz.utc):
+             return "خطا: زمان یادآوری تعیین شده در گذشته است. لطفا زمان آینده را مشخص کنید."
         
         with conn.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO reminders (chat_id, customer_name, reminder_text, due_date_time) VALUES (%s, %s, %s, %s) RETURNING id",
-                (chat_id, customer_name, reminder_text, parsed_datetime)
+                (chat_id, customer_name, reminder_text, utc_datetime) # ذخیره زمان آگاه به منطقه زمانی (UTC)
             )
             new_id = cursor.fetchone()[0]
-            return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت در دیتابیس ثبت شد. (ID: {new_id})"
+            return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} (به وقت ایران) با موفقیت در دیتابیس ثبت شد. (ID: {new_id})"
     except ValueError:
         return "خطا: فرمت تاریخ و زمان هشدار باید به شکل YYYY-MM-DD HH:MM باشد."
     except Exception as e:
         return f"خطا در ثبت هشدار: {e}"
 
+
 def get_report(query_type: str, search_term: str = None, fields: str = "all") -> str:
-    """دریافت گزارش یا اطلاعات خاصی از مشتریان. (اصلاح شده برای رفع خطای تلگرام)"""
+    """دریافت گزارش یا اطلاعات خاصی از مشتریان."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
@@ -254,7 +269,6 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
     try:
         with conn.cursor() as cursor:
             if query_type == 'industry_search' and search_term:
-                # گزارش فیلتر شده بر اساس صنعت
                 field_names = [f.strip() for f in fields.split(',')] if fields != "all" else ["name", "phone", "company", "industry"]
                 
                 cursor.execute(f"SELECT {', '.join(field_names)} FROM customers WHERE industry ILIKE %s", (f"%{search_term}%",))
@@ -263,14 +277,12 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                 if not results:
                     return f"هیچ مشتری در حوزه '{search_term}' پیدا نشد."
                     
-                # فرمت بندی خروجی در بلوک کد برای جلوگیری از خطای پارس تلگرام
                 output = [f"مشتریان در حوزه '{search_term}' (فیلدهای: {', '.join(field_names)}):\n", "```text"]
                 output.extend([" | ".join(map(str, row)) for row in results])
                 output.append("```")
                 return "\n".join(output)
                 
             elif query_type == 'full_customer' and search_term:
-                # جزئیات کامل مشتری و تعاملات
                 cursor.execute("SELECT id, name, phone, company, industry, services FROM customers WHERE name ILIKE %s", (search_term,))
                 customer = cursor.fetchone()
                 
@@ -282,7 +294,6 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                     "Company": customer[3], "Industry": customer[4], "Services": customer[5]
                 }
                 
-                # نمایش داده‌های مشتری در بلوک JSON برای امنیت و خوانایی
                 output = [
                     "جزئیات مشتری (از PostgreSQL):\n",
                     "```json",
@@ -306,7 +317,6 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                 
                 return "\n".join(output)
             
-            # --- مورد جدید: گزارش تمام مشتریان (برای پاسخگویی به درخواست "لیست همه مشتریان") ---
             elif query_type == 'all':
                 cursor.execute(f"SELECT name, phone, company, industry FROM customers")
                 results = cursor.fetchall()
@@ -326,7 +336,7 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
         return f"خطای دیتابیس هنگام گزارش‌گیری: {e}"
 
 # =================================================================
-# --- توابع مدیریت تلگرام (قابلیت ۵ و ۶) ---
+# --- توابع مدیریت تلگرام و وظیفه بک‌گراند ---
 # =================================================================
 
 async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,7 +359,6 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await context.bot.send_message(chat_id=chat_id, text="⚠️ دیتابیس مشتریان خالی است. فایلی برای ارسال وجود ندارد.")
                 return
 
-            # تولید محتوای CSV
             csv_content = [",".join(columns)]
             for row in rows:
                 safe_row = [str(item).replace(',', ';') if item else '' for item in row]
@@ -367,12 +376,8 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error exporting data from PostgreSQL: {e}")
         await context.bot.send_message(chat_id=chat_id, text="❌ خطایی هنگام استخراج داده‌ها از دیتابیس رخ داد.")
 
-# =================================================================
-# --- وظیفه بک‌گراند برای هشدارها (ارسال خودکار پیام) ---
-# =================================================================
-
 async def reminder_checker(application: Application):
-    """وظیفه دوره‌ای برای بررسی و ارسال هشدارهای ثبت شده."""
+    """وظیفه دوره‌ای برای بررسی و ارسال هشدارهای ثبت شده (بررسی بر اساس زمان UTC سرور)."""
     
     while True:
         await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک می‌کند
@@ -383,11 +388,11 @@ async def reminder_checker(application: Application):
             continue
             
         try:
-            # زمان حال را دقیق می‌خوانیم
-            now_time = datetime.now()
+            # زمان حال را دقیقاً به وقت UTC می‌خوانیم
+            now_time = datetime.now(pytz.utc)
             
             with conn.cursor() as cursor:
-                # خواندن هشدارهایی که هنوز ارسال نشده و زمان آن‌ها گذشته یا رسیده است
+                # خواندن هشدارهایی که هنوز ارسال نشده و زمان آن‌ها گذشته یا رسیده است (مقایسه آگاه به منطقه زمانی)
                 cursor.execute(
                     "SELECT id, chat_id, customer_name, reminder_text FROM reminders WHERE sent = FALSE AND due_date_time <= %s", (now_time,)
                 )
@@ -407,9 +412,7 @@ async def reminder_checker(application: Application):
         except Exception as e:
             logger.error(f"Failed to run reminder checker: {e}")
 
-# =================================================================
-# --- تابع اصلی هندلر پیام و اجرا (Main Execution Function) ---
-# =================================================================
+# ... (توابع message_handler, start_command, main بدون تغییر) ...
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ai_client or not update.message or not update.message.text:
@@ -418,12 +421,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_text = update.message.text
     chat_id = update.effective_chat.id
     
-    # بررسی دکمه‌های آماده
     if user_text.strip() == "📥 ارسال فایل کل مشتریان":
         await export_data_to_file(update, context)
         return
     
-    # --- ۱. مدیریت حافظه مکالمه (Conversation History) ---
     if 'history' not in context.user_data:
         context.user_data['history'] = []
     
@@ -431,7 +432,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data['history'].append(types.Content(role="user", parts=[user_part]))
     conversation_history = context.user_data['history']
     
-    # تعریف پرامپت سیستمی (System Instruction)
     system_instruction = (
         "شما یک دستیار هوشمند CRM با **حافظه کامل (PostgreSQL)** و تحلیلگر هوشمند هستید. "
         "وظایف شما: ۱. ثبت، به‌روزرسانی، حذف، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
@@ -443,7 +443,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     
     try:
-        # مرحله ۱: ارسال درخواست با تاریخچه مکالمه
         response = ai_client.models.generate_content(
             model=AI_MODEL,
             contents=conversation_history, 
@@ -453,7 +452,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         )
         
-        # --- تحلیل پاسخ هوش مصنوعی ---
         if response.function_calls:
             function_calls = response.function_calls
             tool_responses = []
@@ -481,7 +479,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             context.user_data['history'].append(types.Content(role="tool", parts=tool_responses))
             
-            # مرحله ۲: ارسال نتیجه به Gemini برای تولید پاسخ نهایی (شامل تحلیل هوشمند)
             final_response = ai_client.models.generate_content(
                 model=AI_MODEL,
                 contents=context.user_data['history'], 
@@ -534,7 +531,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
         f"**مثال‌های هوشمند:**\n"
         f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
-        f" - **هشدار فعال:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.' (فرمت YYYY-MM-DD HH:MM)\n"
+        f" - **هشدار فعال (اصلاح شده):** 'برای هفته بعد دوشنبه ساعت ۱۰:۰۰ پیگیری با نوری رو برام یادآوری کن.' (فرمت **YYYY-MM-DD HH:MM**)\n"
         f" - **حذف:** 'آقای الف رو از لیست مشتریان حذف کن.'\n"
     )
     
@@ -556,6 +553,7 @@ def main() -> None:
         logger.error("GEMINI_API_KEY is not set.")
 
     # --- ابتدا اتصال به PostgreSQL را برقرار و جداول را می‌سازیم ---
+    # توجه: اجرای مجدد init_db باعث می شود جدول reminders تغییر کند.
     if init_db():
         logger.info("PostgreSQL Database is ready for use.")
     else:
