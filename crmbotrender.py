@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import asyncio
 import psycopg2 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -51,8 +51,7 @@ def get_db_connection():
             logger.error("DATABASE_URL is not set. Persistent memory is disabled.")
             return None
         try:
-            # اتصال به دیتابیس PostgreSQL
-            # برای اتصال مطمئن در Render، پارامتر sslmode='require' را اضافه می کنیم.
+            # اتصال به دیتابیس PostgreSQL با نیاز به SSL برای Render
             db_connection = psycopg2.connect(DATABASE_URL, sslmode='require')
             db_connection.autocommit = True
             logger.info("PostgreSQL Connection Established Successfully.")
@@ -80,7 +79,6 @@ def init_db():
                 );
             """)
             # ۲. جدول تعاملات
-            # REFERENCES customers(name) حذف شد تا در صورت حذف مشتری، گزارشات باقی بماند (بهتر است از customer_id استفاده شود اما برای سادگی فعلی، نام را حذف کردیم)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS interactions (
                     id SERIAL PRIMARY KEY,
@@ -129,7 +127,7 @@ def find_customer_data(name: str, phone: str = None):
         return None
         
 def delete_customer(name: str, phone: str = None) -> str:
-    """حذف یک مشتری و گزارشات تعامل مرتبط با او. (قابلیت جدید: حذف)"""
+    """حذف یک مشتری و گزارشات تعامل مرتبط با او."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
@@ -144,15 +142,15 @@ def delete_customer(name: str, phone: str = None) -> str:
             customer_name = customer[1] 
             customer_id = customer[0]
 
-            # ۱. حذف تعاملات مرتبط (اختیاری)
+            # حذف تعاملات مرتبط
             cursor.execute("DELETE FROM interactions WHERE customer_name = %s", (customer_name,))
             deleted_interactions = cursor.rowcount
             
-            # ۲. حذف یادآوری‌های مرتبط (اختیاری)
+            # حذف یادآوری‌های مرتبط
             cursor.execute("DELETE FROM reminders WHERE customer_name = %s", (customer_name,))
             deleted_reminders = cursor.rowcount
 
-            # ۳. حذف مشتری اصلی
+            # حذف مشتری اصلی
             cursor.execute("DELETE FROM customers WHERE id = %s", (customer_id,))
 
             return f"مشتری '{customer_name}' با موفقیت حذف شد. ({deleted_interactions} گزارش تعامل و {deleted_reminders} یادآوری نیز حذف شدند.)"
@@ -161,7 +159,7 @@ def delete_customer(name: str, phone: str = None) -> str:
 
 
 def manage_customer_data(name: str, phone: str, company: str = None, industry: str = None, services: str = None) -> str:
-    """ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود. (قابلیت ۱)"""
+    """ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
@@ -177,7 +175,6 @@ def manage_customer_data(name: str, phone: str, company: str = None, industry: s
                 updates = []
                 params = []
                 
-                # مقایسه و افزودن فیلدهای جدید برای به روز رسانی
                 if company is not None and company != existing[3]: updates.append("company = %s"); params.append(company)
                 if industry is not None and industry != existing[4]: updates.append("industry = %s"); params.append(industry)
                 if services is not None and services != existing[5]: updates.append("services = %s"); params.append(services)
@@ -205,7 +202,7 @@ def manage_customer_data(name: str, phone: str, company: str = None, industry: s
         return f"خطای ناشناخته در ثبت مشتری: {e}"
 
 def log_interaction(customer_name: str, interaction_report: str, follow_up_date: str = None) -> str:
-    """ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود. (قابلیت ۲)"""
+    """ثبت گزارش تماس یا تعامل جدید با یک مشتری موجود."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
@@ -228,13 +225,12 @@ def log_interaction(customer_name: str, interaction_report: str, follow_up_date:
         return f"خطا در ثبت گزارش تعامل: {e}"
 
 def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id: int) -> str:
-    """ثبت یک یادآوری یا هشدار. (قابلیت ۳)"""
+    """ثبت یک یادآوری یا هشدار."""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
     try:
         # تاریخ و زمان را به فرمت قابل قبول PostgreSQL تبدیل می کند
-        # فرض می کنیم Gemini تاریخ و زمان را به شکل YYYY-MM-DD HH:MM می دهد
         parsed_datetime = datetime.strptime(date_time, "%Y-%m-%d %H:%M")
         
         with conn.cursor() as cursor:
@@ -245,13 +241,12 @@ def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id
             new_id = cursor.fetchone()[0]
             return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت در دیتابیس ثبت شد. (ID: {new_id})"
     except ValueError:
-        # اگر فرمت تاریخ اشتباه باشد (خطای قبلی شما)
         return "خطا: فرمت تاریخ و زمان هشدار باید به شکل YYYY-MM-DD HH:MM باشد."
     except Exception as e:
         return f"خطا در ثبت هشدار: {e}"
 
 def get_report(query_type: str, search_term: str = None, fields: str = "all") -> str:
-    """دریافت گزارش یا اطلاعات خاصی از مشتریان. (قابلیت ۴)"""
+    """دریافت گزارش یا اطلاعات خاصی از مشتریان. (اصلاح شده برای رفع خطای تلگرام)"""
     conn = get_db_connection()
     if conn is None:
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
@@ -268,8 +263,10 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                 if not results:
                     return f"هیچ مشتری در حوزه '{search_term}' پیدا نشد."
                     
-                output = [f"مشتریان در حوزه '{search_term}' (فیلدهای: {', '.join(field_names)}):\n", " | ".join(field_names), "-" * 50]
+                # فرمت بندی خروجی در بلوک کد برای جلوگیری از خطای پارس تلگرام
+                output = [f"مشتریان در حوزه '{search_term}' (فیلدهای: {', '.join(field_names)}):\n", "```text"]
                 output.extend([" | ".join(map(str, row)) for row in results])
+                output.append("```")
                 return "\n".join(output)
                 
             elif query_type == 'full_customer' and search_term:
@@ -284,7 +281,14 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                     "ID": customer[0], "Name": customer[1], "Phone": customer[2], 
                     "Company": customer[3], "Industry": customer[4], "Services": customer[5]
                 }
-                output = ["جزئیات مشتری (از PostgreSQL):\n" + json.dumps(customer_data, ensure_ascii=False, indent=2)]
+                
+                # نمایش داده‌های مشتری در بلوک JSON برای امنیت و خوانایی
+                output = [
+                    "جزئیات مشتری (از PostgreSQL):\n",
+                    "```json",
+                    json.dumps(customer_data, ensure_ascii=False, indent=2),
+                    "```"
+                ]
 
                 # جستجوی تعاملات
                 cursor.execute("SELECT interaction_date, report, follow_up_date FROM interactions WHERE customer_name ILIKE %s ORDER BY interaction_date DESC", (search_term,))
@@ -293,7 +297,6 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                 if interactions:
                     output.append("\nگزارشات تعامل:\n")
                     for interaction in interactions:
-                        # تبدیل تاریخ از شیء Date به رشته برای نمایش
                         date = interaction[0].strftime("%Y-%m-%d") if interaction[0] else 'N/A'
                         report = interaction[1]
                         follow_up = interaction[2].strftime("%Y-%m-%d") if interaction[2] else 'ندارد'
@@ -302,7 +305,21 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                     output.append("هیچ گزارش تعاملی ثبت نشده است.")
                 
                 return "\n".join(output)
+            
+            # --- مورد جدید: گزارش تمام مشتریان (برای پاسخگویی به درخواست "لیست همه مشتریان") ---
+            elif query_type == 'all':
+                cursor.execute(f"SELECT name, phone, company, industry FROM customers")
+                results = cursor.fetchall()
                 
+                if not results:
+                    return "هیچ مشتری ثبت شده‌ای در دیتابیس یافت نشد."
+                    
+                output = ["لیست کامل مشتریان ثبت شده:\n", "```text"]
+                output.extend([" | ".join(map(str, row)) for row in results])
+                output.append("```")
+                output.append("\n**نکته:** برای دریافت جزئیات کامل و گزارشات تعامل هر مشتری، نام او را درخواست کنید.")
+                return "\n".join(output)
+
             return f"نوع گزارش '{query_type}' پشتیبانی نمی‌شود یا عبارت جستجو مشخص نیست."
     except Exception as e:
         logger.error(f"Error getting report: {e}")
@@ -313,7 +330,7 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
 # =================================================================
 
 async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """تولید فایل CSV از اطلاعات کامل مشتریان و ارسال آن به کاربر (قابلیت ۵)."""
+    """تولید فایل CSV از اطلاعات کامل مشتریان و ارسال آن به کاربر."""
     conn = get_db_connection()
     if conn is None:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ سرویس حافظه دائمی (PostgreSQL) فعال نیست.")
@@ -324,7 +341,6 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     try:
         with conn.cursor() as cursor:
-            # خواندن تمام داده‌ها از جدول مشتریان
             cursor.execute("SELECT * FROM customers")
             columns = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
@@ -336,13 +352,11 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             # تولید محتوای CSV
             csv_content = [",".join(columns)]
             for row in rows:
-                # جایگزینی کاما با نقطه ویرگول برای جلوگیری از بهم ریختگی CSV
                 safe_row = [str(item).replace(',', ';') if item else '' for item in row]
                 csv_content.append(",".join(safe_row))
                 
             file_name = f"CRM_Customers_Export_{TODAY_DATE}.csv"
             
-            # ارسال فایل (با استفاده از utf-8 برای پشتیبانی از فارسی)
             await context.bot.send_document(
                 chat_id=chat_id, 
                 document=bytes("\n".join(csv_content).encode('utf-8')),
@@ -354,7 +368,7 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=chat_id, text="❌ خطایی هنگام استخراج داده‌ها از دیتابیس رخ داد.")
 
 # =================================================================
-# --- وظیفه بک‌گراند برای هشدارها (قابلیت ۳: ارسال خودکار پیام) ---
+# --- وظیفه بک‌گراند برای هشدارها (ارسال خودکار پیام) ---
 # =================================================================
 
 async def reminder_checker(application: Application):
@@ -363,16 +377,19 @@ async def reminder_checker(application: Application):
     while True:
         await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک می‌کند
         
-        conn = get_db_connection() # اتصال را در داخل حلقه چک می کنیم
+        conn = get_db_connection() 
         if conn is None:
             logger.warning("Reminder checker skipped: PostgreSQL not initialized.")
             continue
             
         try:
+            # زمان حال را دقیق می‌خوانیم
+            now_time = datetime.now()
+            
             with conn.cursor() as cursor:
                 # خواندن هشدارهایی که هنوز ارسال نشده و زمان آن‌ها گذشته یا رسیده است
                 cursor.execute(
-                    "SELECT id, chat_id, customer_name, reminder_text FROM reminders WHERE sent = FALSE AND due_date_time <= NOW()"
+                    "SELECT id, chat_id, customer_name, reminder_text FROM reminders WHERE sent = FALSE AND due_date_time <= %s", (now_time,)
                 )
                 reminders_to_send = cursor.fetchall()
                 
@@ -401,7 +418,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_text = update.message.text
     chat_id = update.effective_chat.id
     
-    # بررسی دکمه‌های آماده (قابلیت ۶)
+    # بررسی دکمه‌های آماده
     if user_text.strip() == "📥 ارسال فایل کل مشتریان":
         await export_data_to_file(update, context)
         return
@@ -414,12 +431,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data['history'].append(types.Content(role="user", parts=[user_part]))
     conversation_history = context.user_data['history']
     
-    # تعریف پرامپت سیستمی (System Instruction) (قابلیت ۷)
+    # تعریف پرامپت سیستمی (System Instruction)
     system_instruction = (
         "شما یک دستیار هوشمند CRM با **حافظه کامل (PostgreSQL)** و تحلیلگر هوشمند هستید. "
         "وظایف شما: ۱. ثبت، به‌روزرسانی، حذف، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
-        "۲. ارائه گزارش هوشمند و فیلتر شده (قابلیت ۴). "
-        "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی (قابلیت ۷):** پس از اجرای موفقیت‌آمیز هر تابع **ثبت/حذف**، باید داده‌های جدید و تاریخچه را تحلیل کنید و **به صورت یک پاراگراف جداگانه**، یک پیشنهاد عملی (Actionable Advice) برای پیگیری بعدی یا بهبود روند فروش ارائه دهید (مانند بهترین زمان تماس، پیشنهادات رقابتی، یا مراحل بعدی). "
+        "۲. ارائه گزارش هوشمند و فیلتر شده. در هنگام گزارش‌گیری لیست کامل مشتریان، هوش مصنوعی باید از تابع get_report با query_type='all' استفاده کند. "
+        "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی:** پس از اجرای موفقیت‌آمیز هر تابع **ثبت/حذف**، یک پیشنهاد عملی برای پیگیری بعدی ارائه دهید. "
         "**قوانین:** 1. هرگاه داده‌های اجباری برای یک تابع جمع‌آوری شد، آن را فراخوانی کنید. 2. همیشه پاسخ های خود را به زبان فارسی و دوستانه بنویسید. 3. در فراخوانی تابع set_reminder، 'chat_id' را برابر با **" + str(chat_id) + "** قرار دهید."
     )
 
@@ -432,7 +449,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             contents=conversation_history, 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                # اضافه کردن تابع حذف (delete_customer)
                 tools=[manage_customer_data, log_interaction, set_reminder, get_report, delete_customer]
             )
         )
@@ -499,13 +515,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if 'history' in context.user_data:
         del context.user_data['history']
         
-    # بررسی وضعیت اتصال AI
     ai_status = "✅ متصل و آماده" if ai_client else "❌ غیرفعال (کلید API را بررسی کنید)."
     
-    # بررسی وضعیت اتصال دیتابیس
     conn = get_db_connection()
     db_status = "✅ متصل به PostgreSQL" if conn else "❌ مشکل در اتصال به دیتابیس"
-    if conn: conn.close() # بستن اتصال موقت
+    if conn: conn.close()
     
     reply_keyboard = [
         ["✍️ ثبت اطلاعات جدید", "📞 ثبت گزارش تماس"],
@@ -520,7 +534,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
         f"**مثال‌های هوشمند:**\n"
         f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
-        f" - **هشدار فعال:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.' (تاریخ باید به فرمت YYYY-MM-DD HH:MM باشد.)\n"
+        f" - **هشدار فعال:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.' (فرمت YYYY-MM-DD HH:MM)\n"
         f" - **حذف:** 'آقای الف رو از لیست مشتریان حذف کن.'\n"
     )
     
@@ -541,7 +555,7 @@ def main() -> None:
     else:
         logger.error("GEMINI_API_KEY is not set.")
 
-    # --- ابتدا اتصال به PostgreSQL را برقرار و جداول را می‌سازیم (نقطه حیاتی برای حافظه دائمی) ---
+    # --- ابتدا اتصال به PostgreSQL را برقرار و جداول را می‌سازیم ---
     if init_db():
         logger.info("PostgreSQL Database is ready for use.")
     else:
@@ -549,12 +563,12 @@ def main() -> None:
 
     
     if RENDER_EXTERNAL_URL and TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        # --- اجرای Webhook ---
+        # --- اجرای Webhook (برای Render) ---
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
-        # اجرای وظیفه یادآوری (Reminders) به صورت خودکار
+        # اجرای وظیفه یادآوری (Reminders)
         if application.job_queue:
             application.job_queue.run_once(
                 lambda context: asyncio.create_task(reminder_checker(application)),
