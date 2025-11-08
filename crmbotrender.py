@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 import json
 import asyncio
-import psycopg2 # <--- جدید: برای اتصال به PostgreSQL
+import psycopg2 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # --- متغیرهای حیاتی و محیطی ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
-DATABASE_URL = os.environ.get("DATABASE_URL") # <--- جدید: آدرس اتصال PostgreSQL
+DATABASE_URL = os.environ.get("DATABASE_URL") # آدرس اتصال PostgreSQL از Render
 
 # متغیرهای Webhook/Render
 PORT = int(os.environ.get('PORT', '8000'))
@@ -52,7 +52,8 @@ def get_db_connection():
             return None
         try:
             # اتصال به دیتابیس PostgreSQL
-            db_connection = psycopg2.connect(DATABASE_URL)
+            # برای اتصال مطمئن در Render، پارامتر sslmode='require' را اضافه می کنیم.
+            db_connection = psycopg2.connect(DATABASE_URL, sslmode='require')
             db_connection.autocommit = True
             logger.info("PostgreSQL Connection Established Successfully.")
         except Exception as e:
@@ -79,10 +80,11 @@ def init_db():
                 );
             """)
             # ۲. جدول تعاملات
+            # REFERENCES customers(name) حذف شد تا در صورت حذف مشتری، گزارشات باقی بماند (بهتر است از customer_id استفاده شود اما برای سادگی فعلی، نام را حذف کردیم)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS interactions (
                     id SERIAL PRIMARY KEY,
-                    customer_name VARCHAR(255) REFERENCES customers(name),
+                    customer_name VARCHAR(255) NOT NULL, 
                     interaction_date DATE,
                     report TEXT,
                     follow_up_date DATE
@@ -106,7 +108,6 @@ def init_db():
         return False
 
 # --- توابع (Functions) که هوش مصنوعی به آنها دسترسی دارد (Tools) ---
-# توابع زیر اکنون با PostgreSQL کار می‌کنند.
 
 def find_customer_data(name: str, phone: str = None):
     """جستجوی مشتری بر اساس نام و/یا تلفن و بازگرداندن داده‌ها."""
@@ -126,6 +127,38 @@ def find_customer_data(name: str, phone: str = None):
     except Exception as e:
         logger.error(f"Error finding customer: {e}")
         return None
+        
+def delete_customer(name: str, phone: str = None) -> str:
+    """حذف یک مشتری و گزارشات تعامل مرتبط با او. (قابلیت جدید: حذف)"""
+    conn = get_db_connection()
+    if conn is None:
+        return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
+
+    customer = find_customer_data(name, phone)
+    
+    if not customer:
+        return f"خطا: مشتری با نام '{name}' در دیتابیس پیدا نشد."
+        
+    try:
+        with conn.cursor() as cursor:
+            customer_name = customer[1] 
+            customer_id = customer[0]
+
+            # ۱. حذف تعاملات مرتبط (اختیاری)
+            cursor.execute("DELETE FROM interactions WHERE customer_name = %s", (customer_name,))
+            deleted_interactions = cursor.rowcount
+            
+            # ۲. حذف یادآوری‌های مرتبط (اختیاری)
+            cursor.execute("DELETE FROM reminders WHERE customer_name = %s", (customer_name,))
+            deleted_reminders = cursor.rowcount
+
+            # ۳. حذف مشتری اصلی
+            cursor.execute("DELETE FROM customers WHERE id = %s", (customer_id,))
+
+            return f"مشتری '{customer_name}' با موفقیت حذف شد. ({deleted_interactions} گزارش تعامل و {deleted_reminders} یادآوری نیز حذف شدند.)"
+    except Exception as e:
+        return f"خطای دیتابیس در حذف مشتری: {e}"
+
 
 def manage_customer_data(name: str, phone: str, company: str = None, industry: str = None, services: str = None) -> str:
     """ثبت مشتری جدید یا به‌روزرسانی اطلاعات مشتری موجود. (قابلیت ۱)"""
@@ -144,6 +177,7 @@ def manage_customer_data(name: str, phone: str, company: str = None, industry: s
                 updates = []
                 params = []
                 
+                # مقایسه و افزودن فیلدهای جدید برای به روز رسانی
                 if company is not None and company != existing[3]: updates.append("company = %s"); params.append(company)
                 if industry is not None and industry != existing[4]: updates.append("industry = %s"); params.append(industry)
                 if services is not None and services != existing[5]: updates.append("services = %s"); params.append(services)
@@ -200,6 +234,7 @@ def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id
         return "خطا: سرویس حافظه دائمی (PostgreSQL) فعال نیست."
     try:
         # تاریخ و زمان را به فرمت قابل قبول PostgreSQL تبدیل می کند
+        # فرض می کنیم Gemini تاریخ و زمان را به شکل YYYY-MM-DD HH:MM می دهد
         parsed_datetime = datetime.strptime(date_time, "%Y-%m-%d %H:%M")
         
         with conn.cursor() as cursor:
@@ -210,6 +245,7 @@ def set_reminder(customer_name: str, reminder_text: str, date_time: str, chat_id
             new_id = cursor.fetchone()[0]
             return f"هشدار با متن '{reminder_text[:30]}...' برای {date_time} با موفقیت در دیتابیس ثبت شد. (ID: {new_id})"
     except ValueError:
+        # اگر فرمت تاریخ اشتباه باشد (خطای قبلی شما)
         return "خطا: فرمت تاریخ و زمان هشدار باید به شکل YYYY-MM-DD HH:MM باشد."
     except Exception as e:
         return f"خطا در ثبت هشدار: {e}"
@@ -223,7 +259,7 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
     try:
         with conn.cursor() as cursor:
             if query_type == 'industry_search' and search_term:
-                # جستجو بر اساس صنعت
+                # گزارش فیلتر شده بر اساس صنعت
                 field_names = [f.strip() for f in fields.split(',')] if fields != "all" else ["name", "phone", "company", "industry"]
                 
                 cursor.execute(f"SELECT {', '.join(field_names)} FROM customers WHERE industry ILIKE %s", (f"%{search_term}%",))
@@ -257,6 +293,7 @@ def get_report(query_type: str, search_term: str = None, fields: str = "all") ->
                 if interactions:
                     output.append("\nگزارشات تعامل:\n")
                     for interaction in interactions:
+                        # تبدیل تاریخ از شیء Date به رشته برای نمایش
                         date = interaction[0].strftime("%Y-%m-%d") if interaction[0] else 'N/A'
                         report = interaction[1]
                         follow_up = interaction[2].strftime("%Y-%m-%d") if interaction[2] else 'ندارد'
@@ -317,19 +354,20 @@ async def export_data_to_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.send_message(chat_id=chat_id, text="❌ خطایی هنگام استخراج داده‌ها از دیتابیس رخ داد.")
 
 # =================================================================
-# --- وظیفه بک‌گراند برای هشدارها (قابلیت ۳) ---
+# --- وظیفه بک‌گراند برای هشدارها (قابلیت ۳: ارسال خودکار پیام) ---
 # =================================================================
 
 async def reminder_checker(application: Application):
     """وظیفه دوره‌ای برای بررسی و ارسال هشدارهای ثبت شده."""
-    conn = get_db_connection()
-    if conn is None:
-        logger.warning("Reminder checker skipped: PostgreSQL not initialized.")
-        return
-        
+    
     while True:
         await asyncio.sleep(60) # هر ۶۰ ثانیه یک بار چک می‌کند
         
+        conn = get_db_connection() # اتصال را در داخل حلقه چک می کنیم
+        if conn is None:
+            logger.warning("Reminder checker skipped: PostgreSQL not initialized.")
+            continue
+            
         try:
             with conn.cursor() as cursor:
                 # خواندن هشدارهایی که هنوز ارسال نشده و زمان آن‌ها گذشته یا رسیده است
@@ -356,8 +394,6 @@ async def reminder_checker(application: Application):
 # --- تابع اصلی هندلر پیام و اجرا (Main Execution Function) ---
 # =================================================================
 
-# (تابع message_handler و start_command نیازی به تغییر عمده ندارند و همان منطق قبلی را دنبال می‌کنند)
-
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ai_client or not update.message or not update.message.text:
         return
@@ -381,9 +417,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # تعریف پرامپت سیستمی (System Instruction) (قابلیت ۷)
     system_instruction = (
         "شما یک دستیار هوشمند CRM با **حافظه کامل (PostgreSQL)** و تحلیلگر هوشمند هستید. "
-        "وظایف شما: ۱. ثبت و به‌روزرسانی دقیق داده‌ها، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
+        "وظایف شما: ۱. ثبت، به‌روزرسانی، حذف، ثبت گزارش‌ها و تنظیم هشدارها با استفاده از توابع (Tools). "
         "۲. ارائه گزارش هوشمند و فیلتر شده (قابلیت ۴). "
-        "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی (قابلیت ۷):** پس از اجرای موفقیت‌آمیز هر تابع **ثبت**، باید داده‌های جدید و تاریخچه را تحلیل کنید و **به صورت یک پاراگراف جداگانه**، یک پیشنهاد عملی (Actionable Advice) برای پیگیری بعدی یا بهبود روند فروش ارائه دهید (مانند بهترین زمان تماس، پیشنهادات رقابتی، یا مراحل بعدی). "
+        "۳. **تحلیل هوشمند و ارائه پیشنهاد عملی (قابلیت ۷):** پس از اجرای موفقیت‌آمیز هر تابع **ثبت/حذف**، باید داده‌های جدید و تاریخچه را تحلیل کنید و **به صورت یک پاراگراف جداگانه**، یک پیشنهاد عملی (Actionable Advice) برای پیگیری بعدی یا بهبود روند فروش ارائه دهید (مانند بهترین زمان تماس، پیشنهادات رقابتی، یا مراحل بعدی). "
         "**قوانین:** 1. هرگاه داده‌های اجباری برای یک تابع جمع‌آوری شد، آن را فراخوانی کنید. 2. همیشه پاسخ های خود را به زبان فارسی و دوستانه بنویسید. 3. در فراخوانی تابع set_reminder، 'chat_id' را برابر با **" + str(chat_id) + "** قرار دهید."
     )
 
@@ -396,7 +432,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             contents=conversation_history, 
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                tools=[manage_customer_data, log_interaction, set_reminder, get_report]
+                # اضافه کردن تابع حذف (delete_customer)
+                tools=[manage_customer_data, log_interaction, set_reminder, get_report, delete_customer]
             )
         )
         
@@ -416,6 +453,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     if 'chat_id' not in args: args['chat_id'] = chat_id 
                     tool_result = set_reminder(**args)
                 elif function_name == 'get_report': tool_result = get_report(**args)
+                elif function_name == 'delete_customer': tool_result = delete_customer(**args)
                 else: tool_result = f"خطا: تابع {function_name} ناشناخته است."
                     
                 tool_responses.append(
@@ -433,7 +471,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 contents=context.user_data['history'], 
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    tools=[manage_customer_data, log_interaction, set_reminder, get_report]
+                    tools=[manage_customer_data, log_interaction, set_reminder, get_report, delete_customer]
                 )
             )
             
@@ -461,8 +499,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if 'history' in context.user_data:
         del context.user_data['history']
         
+    # بررسی وضعیت اتصال AI
     ai_status = "✅ متصل و آماده" if ai_client else "❌ غیرفعال (کلید API را بررسی کنید)."
     
+    # بررسی وضعیت اتصال دیتابیس
     conn = get_db_connection()
     db_status = "✅ متصل به PostgreSQL" if conn else "❌ مشکل در اتصال به دیتابیس"
     if conn: conn.close() # بستن اتصال موقت
@@ -480,7 +520,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"**نحوه استفاده:** هرگونه پیام یا درخواستی که دارید را ارسال کنید، یا از دکمه‌های زیر استفاده کنید. ربات نیت شما را درک و عملیات لازم را انجام می‌دهد و **پیشنهاد هوشمندانه** می‌دهد.\n\n"
         f"**مثال‌های هوشمند:**\n"
         f" - **ثبت و تحلیل:** 'با آقای نوری صحبت کردم. گفت قیمت رقبا بالاتره.'\n"
-        f" - **هشدار:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.'\n"
+        f" - **هشدار فعال:** 'برای هفته بعد دوشنبه ساعت ۱۰ صبح پیگیری با نوری رو برام یادآوری کن.' (تاریخ باید به فرمت YYYY-MM-DD HH:MM باشد.)\n"
+        f" - **حذف:** 'آقای الف رو از لیست مشتریان حذف کن.'\n"
     )
     
     await update.message.reply_text(message, reply_markup=markup, parse_mode='Markdown')
@@ -491,12 +532,16 @@ def main() -> None:
     
     global ai_client
     if GEMINI_API_KEY and GEMINI_API_KEY != "YOUR_API_KEY_HERE":
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info("Gemini Client and Model Initialized Successfully.")
+        try:
+            ai_client = genai.Client(api_key=GEMINI_API_KEY)
+            logger.info("Gemini Client and Model Initialized Successfully.")
+        except Exception as e:
+            logger.error(f"Error initializing Gemini client: {e}")
+            
     else:
         logger.error("GEMINI_API_KEY is not set.")
 
-    # --- ابتدا اتصال به PostgreSQL را برقرار و جداول را می‌سازیم ---
+    # --- ابتدا اتصال به PostgreSQL را برقرار و جداول را می‌سازیم (نقطه حیاتی برای حافظه دائمی) ---
     if init_db():
         logger.info("PostgreSQL Database is ready for use.")
     else:
@@ -509,6 +554,7 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
         
+        # اجرای وظیفه یادآوری (Reminders) به صورت خودکار
         if application.job_queue:
             application.job_queue.run_once(
                 lambda context: asyncio.create_task(reminder_checker(application)),
